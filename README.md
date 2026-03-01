@@ -42,6 +42,15 @@ Please raise a GitHub issue with the following:
 * Description of issue
 * Description of how to reproduce the issue
 
+## Links to Useful Information
+
+A great deal of information is avilable online regarding amplifier building, physics and designs, some of the links have provided invaluable information and insight:
+
+* [ampbooks](https://www.ampbooks.com/)
+* [robrobinette](https://robrobinette.com/)
+* [helmutkelleraudio](https://www.helmutkelleraudio.de/)
+* [diyaudio](https://www.diyaudio.com/)
+
 ## Author
 
 * Daniel Wray

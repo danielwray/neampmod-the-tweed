@@ -1,0 +1,19 @@
+services:
+  build:
+    build: .
+    environment:
+      - RUSTFLAGS=-C target-cpu=x86-64-v3
+    volumes:
+      - .:/workspace
+      - ./plugins:/output
+    working_dir: /workspace
+    command: |
+      bash -c "
+        cd xtask && cargo run -- bundle the-tweed --release && cd ..
+        mkdir -p /output
+        cp -r target/bundled/the-tweed.vst3 /output/
+        cp target/bundled/the-tweed.vst3/Contents/x86_64-linux/the-tweed.so /output/the-tweed-single.vst3
+        cp target/bundled/the-tweed.clap /output/
+        echo 'Build completed! VST3 (bundle + single file) and CLAP plugins available in plugins/ directory'
+        ls -la /output/
+      "
