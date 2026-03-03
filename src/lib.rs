@@ -370,12 +370,12 @@ impl Default for TheTweed {
 
         // 5E3-specific grid config: 22nF coupling caps
         let v1_grid_12ay7 = GridCurrentConfig {
-            coupling_cap: 22e-9,
+            coupling_cap: 100e-9,
             charge_multiplier: 0.004,
             ..PreampTubeType::Triode12AY7.grid_config()
         };
         let v1_grid_12ax7 = GridCurrentConfig {
-            coupling_cap: 22e-9,
+            coupling_cap: 100e-9,
             charge_multiplier: 0.004,
             ..PreampTubeType::Triode12AX7.grid_config()
         };
@@ -621,12 +621,12 @@ impl Plugin for TheTweed {
 
         // 5E3-specific grid configs
         let v1_grid_12ay7 = GridCurrentConfig {
-            coupling_cap: 22e-9,
+            coupling_cap: 100e-9,
             charge_multiplier: 0.004,
             ..PreampTubeType::Triode12AY7.grid_config()
         };
         let v1_grid_12ax7 = GridCurrentConfig {
-            coupling_cap: 22e-9,
+            coupling_cap: 100e-9,
             charge_multiplier: 0.004,
             ..PreampTubeType::Triode12AX7.grid_config()
         };

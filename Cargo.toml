@@ -1,6 +1,6 @@
 [package]
 name = "the-tweed"
-version = "1.4.15"
+version = "1.4.16"
 edition = "2021"
 authors = ["NEAMPMOD <daniel.wray.uk+neampmod@gmail.com>"]
 description = "Vintage tweed amplifier simulator inspired by classic 1950s circuits"
