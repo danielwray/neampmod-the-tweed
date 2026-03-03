@@ -387,7 +387,7 @@ impl Default for TheTweed {
             input_cal: InputCalibration::amp_standard(),
             output_cal: OutputCalibration::pro_audio_headroom(),
 
-            // 5E3 tone circuit: 500pF coupling, 4.7nF tone-to-ground, 1MΩ pot
+            // 5E3 tone circuit: 4.7nF tone-to-ground, 1MΩ pot
             // Source impedance: ~34kΩ (68kΩ || 68kΩ mixing resistors in default Both mode)
             tone_stack: ToneStack5E3::from_components(
                 ToneStack5E3Components::default_5e3(),
@@ -471,7 +471,7 @@ impl Default for TheTweed {
             power_tube_1: {
                 let mut tube = PowerTubeStage::new(sample_rate, PowerTubeType::BeamTetrode6V6);
                 tube.set_grid_config(sample_rate, GridCurrentConfig {
-                    coupling_cap: 22e-9,
+                    coupling_cap: 100e-9,
                     charge_multiplier: 0.006,
                     ..PowerTubeType::BeamTetrode6V6.grid_config()
                 });
@@ -480,7 +480,7 @@ impl Default for TheTweed {
             power_tube_2: {
                 let mut tube = PowerTubeStage::new(sample_rate, PowerTubeType::BeamTetrode6V6);
                 tube.set_grid_config(sample_rate, GridCurrentConfig {
-                    coupling_cap: 22e-9,
+                    coupling_cap: 100e-9,
                     charge_multiplier: 0.006,
                     ..PowerTubeType::BeamTetrode6V6.grid_config()
                 });
@@ -687,13 +687,13 @@ impl Plugin for TheTweed {
         // Power tubes (6V6)
         self.power_tube_1 = PowerTubeStage::new(self.sample_rate, PowerTubeType::BeamTetrode6V6);
         self.power_tube_1.set_grid_config(self.sample_rate, GridCurrentConfig {
-            coupling_cap: 22e-9,
+            coupling_cap: 100e-9,
             charge_multiplier: 0.006,
             ..PowerTubeType::BeamTetrode6V6.grid_config()
         });
         self.power_tube_2 = PowerTubeStage::new(self.sample_rate, PowerTubeType::BeamTetrode6V6);
         self.power_tube_2.set_grid_config(self.sample_rate, GridCurrentConfig {
-            coupling_cap: 22e-9,
+            coupling_cap: 100e-9,
             charge_multiplier: 0.006,
             ..PowerTubeType::BeamTetrode6V6.grid_config()
         });
