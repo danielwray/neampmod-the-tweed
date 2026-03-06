@@ -6,9 +6,10 @@ The signal chain follows the real amp: dual-triode preamp (V1A/V1B) into a 68kΩ
 through the tone circuit, into a 12AX7 gain stage (V2A), cathodyne phase inverter, and push-pull 
 6V6 power section with an output transformer. A cabinet impulse response is applied at the output,
 
-The 5E3's "interesting" channel interaction is modelled — in "Both" mode, the two volume controls 
-affect each other through the mixing network and V2A's grid leak path. In addition the tone control
-feeds into the interaction.
+I've tried to capture the 5E3's "interesting" channel interaction - the tone, and two volume
+channels interact via an MNA network. Unlike the real 5e3 the interaction on the volume channels
+is inverted (not by design...), so if you drive the Bright channel in Bright channel mode then
+turn down the Normal channel it will attenuate the signal, and so it goes for the inverse.
 
 The bright channel includes a 500pF treble bypass capacitor.
 
@@ -22,7 +23,7 @@ is tracked independently per power tube.
 
 ## Using the Plugin
 
-The Tweed is available in VST3 and CLAP plugin formats, though only for Linux systems at the moment.
+The Tweed is available in VST3 and CLAP plugin formats for Linux and Windows.
 
 To install the plugins copy the `.vst3` to your VST3 directory, and likewise to your `.clap` directory for
 the CLAP plugin.
@@ -57,7 +58,9 @@ A great deal of information is avilable online regarding amplifier building, phy
 
 ## License and Legal Information
 
-This plugin is released under a Freeware EULA (see LICENSE.md).
+This code is released under the [GNU GPLv3 license](LICENSE).
+
+The binaries (VST3, CLAP) arereleased under a [Freeware EULA license](BINARY_LICENSE).
 
 * Fender® is a registrated trademark of Fender Musical Instruments Corporation.
 * VST® is a registered trademark of Steinberg Media Technologies GmbH.

@@ -33,9 +33,10 @@ use neampmod_engine::{
     PowerTubeBiasConfig,
     // Filters
     DCBlocker,
-    ToneStack5E3,
-    ToneStack5E3Components,
-    BrightChannelFilter,
+    NthOrderTdfii,
+    // MNA mixing + tone network
+    MnaSystem,
+    PassiveNetworkSpec,
     // Output transformer
     OutputTransformer,
     TransformerType,
@@ -293,9 +294,14 @@ pub struct TheTweed {
     input_cal: InputCalibration,
     output_cal: OutputCalibration,
 
-    // Tone stack and channel filters
-    tone_stack: ToneStack5E3,
-    bright_channel_filter: BrightChannelFilter,
+    // Unified MNA mixing + tone network (replaces BrightChannelFilter, manual mixing, ToneStack5E3)
+    // Two transfer functions — one per input channel — solved from the same 5E3 passive netlist.
+    // Controls: [normal_wiper, bright_wiper, tone] — updated per-sample with change detection.
+    mna_normal: MnaSystem,      // H(s): V1A coupling cap -> V2A grid
+    mna_bright: MnaSystem,      // H(s): V1B coupling cap -> V2A grid
+    filter_normal: NthOrderTdfii,
+    filter_bright: NthOrderTdfii,
+    mixing_tone_controls: [f64; 3],  // cached for change detection
 
     // Tube bias modeling
     preamp_bias: CathodeBias,
@@ -387,14 +393,22 @@ impl Default for TheTweed {
             input_cal: InputCalibration::amp_standard(),
             output_cal: OutputCalibration::pro_audio_headroom(),
 
-            // 5E3 tone circuit: 4.7nF tone-to-ground, 1MΩ pot
-            // Source impedance: ~34kΩ (68kΩ || 68kΩ mixing resistors in default Both mode)
-            tone_stack: ToneStack5E3::from_components(
-                ToneStack5E3Components::default_5e3(),
-                34_000.0,
-                sample_rate,
-            ),
-            bright_channel_filter: BrightChannelFilter::with_capacitance(500e-12),  // 500pF
+            // Full MNA model of the 5E3 mixing + tone passive network.
+            mna_normal: {
+                let spec = PassiveNetworkSpec::mixing_5e3_normal(
+                    100_000.0, 1_000_000.0, 68_000.0, 1_000_000.0, 500e-12, 4.7e-9,
+                );
+                MnaSystem::from_netlist(&spec).expect("5E3 normal mixing netlist")
+            },
+            mna_bright: {
+                let spec = PassiveNetworkSpec::mixing_5e3_bright(
+                    100_000.0, 1_000_000.0, 68_000.0, 1_000_000.0, 500e-12, 4.7e-9,
+                );
+                MnaSystem::from_netlist(&spec).expect("5E3 bright mixing netlist")
+            },
+            filter_normal: NthOrderTdfii::new(2, sample_rate),
+            filter_bright: NthOrderTdfii::new(2, sample_rate),
+            mixing_tone_controls: [-1.0; 3],
 
             preamp_bias: CathodeBias::new(CathodeBiasConfig::fender_5e3()),
             power_bias: PowerTubeBias::new_cathode(
@@ -607,13 +621,24 @@ impl Plugin for TheTweed {
         self.params.tone.smoothed.reset(self.params.tone.value());
         self.params.master.smoothed.reset(self.params.master.value());
 
-        // Initialize tone stack with 5E3 component values and source impedance
-        self.tone_stack = ToneStack5E3::from_components(
-            ToneStack5E3Components::default_5e3(),
-            34_000.0,
-            self.sample_rate,
-        );
-        self.bright_channel_filter.reset();
+        // Rebuild MNA mixing + tone network at new sample rate.
+        {
+            let spec = PassiveNetworkSpec::mixing_5e3_normal(
+                100_000.0, 1_000_000.0, 68_000.0, 1_000_000.0, 500e-12, 4.7e-9,
+            );
+            self.mna_normal = MnaSystem::from_netlist(&spec)
+                .expect("5E3 normal mixing netlist");
+        }
+        {
+            let spec = PassiveNetworkSpec::mixing_5e3_bright(
+                100_000.0, 1_000_000.0, 68_000.0, 1_000_000.0, 500e-12, 4.7e-9,
+            );
+            self.mna_bright = MnaSystem::from_netlist(&spec)
+                .expect("5E3 bright mixing netlist");
+        }
+        self.filter_normal = NthOrderTdfii::new(2, self.sample_rate);
+        self.filter_bright = NthOrderTdfii::new(2, self.sample_rate);
+        self.mixing_tone_controls = [-1.0; 3];
 
         // Initialize bias modeling
         self.preamp_bias.initialize(self.sample_rate);
@@ -737,9 +762,10 @@ impl Plugin for TheTweed {
         self.params.tone.smoothed.reset(self.params.tone.value());
         self.params.master.smoothed.reset(self.params.master.value());
 
-        // Reset filters
-        self.tone_stack.reset();
-        self.bright_channel_filter.reset();
+        // Reset MNA mixing + tone filters
+        self.filter_normal.reset();
+        self.filter_bright.reset();
+        self.mixing_tone_controls = [-1.0; 3];
 
         // Reset bias modeling
         self.preamp_bias.reset();
@@ -808,14 +834,6 @@ impl Plugin for TheTweed {
         let mut power_current_accumulator = 0.0_f32;
         let mut sample_count = 0_usize;
 
-        // Set tonestack source impedance based on channel configuration
-        // Both (jumpered): 68kΩ || 68kΩ ≈ 34kΩ driving impedance at tone circuit
-        // Single channel: one 68kΩ mixing resistor drives the tone circuit
-        let source_z = match self.params.channel_select.value() {
-            ChannelMode::Both => 34_000.0,
-            _ => 68_000.0,
-        };
-        self.tone_stack.set_source_impedance(source_z);
 
         // === V2A VARIABLE GRID LEAK (5E3 Cross-Channel Interaction) ===
         // In the 5E3, V2A has no dedicated grid leak resistor — the volume pots
@@ -937,66 +955,33 @@ impl Plugin for TheTweed {
                 };
                 let v1b_coupled = self.coupling_v1b.process(v1b_out);
 
-                // Bright cap (500pF) — process pre-volume signal, filter uses wiper position
-                // to calculate RC response (low volume = more resistance above wiper = more treble bypass)
-                self.bright_channel_filter.update(bright_wiper, self.sample_rate);
-                let v1b_bright = self.bright_channel_filter.process(v1b_coupled, bright_wiper);
-
-                // === 68kΩ MIXING NETWORK (5E3 Cross-Channel Interaction) ===
-                // Each channel drives through 68kΩ into a summing node.
-                // The opposing channel's volume pot + plate load create a variable shunt:
-                //   vol=0 -> wiper at ground -> 68kΩ to ground (heavy loading, ~48% through)
-                //   vol=max -> wiper at hot -> 68k + (1MΩ || 100kΩ) ≈ 159kΩ (still loaded, ~67%)
-                // Rob Robinette: "Load range: 100k at max volume to 1M at min volume"
-                // The 100kΩ plate load provides an AC path to ground through the coupling
-                // cap at the top of the pot, keeping the load moderate even at max volume.
-                const MIXING_R: f32 = 68_000.0;    // 68kΩ mixing resistors
-                const POT_R: f32 = 1_000_000.0;     // 1MΩ volume pots
-                const PLATE_LOAD: f32 = 100_000.0;  // 100kΩ plate load (AC ground via coupling cap)
-                const TONE_Z: f32 = 1_000_000.0;    // V2A grid + tone stack input impedance
-
-                // Shunt impedance: 68kΩ + wiper impedance
-                // Wiper sees two paths to AC ground:
-                //   1. Down through pot to ground: R_to_gnd = wiper_frac × R_pot
-                //   2. Up through pot to plate load: R_to_hot = (1-wiper_frac) × R_pot + R_plate
-                // Wiper impedance = R_to_gnd || R_to_hot
-                // The wiper fraction from the audio taper gives the physical resistance split.
-                let bright_wiper_z = {
-                    let r_to_gnd = POT_R * bright_wiper;
-                    let r_to_hot = POT_R * (1.0 - bright_wiper) + PLATE_LOAD;
-                    if r_to_gnd < 1.0 { 0.0 } else { (r_to_gnd * r_to_hot) / (r_to_gnd + r_to_hot) }
-                };
-                let normal_wiper_z = {
-                    let r_to_gnd = POT_R * normal_wiper;
-                    let r_to_hot = POT_R * (1.0 - normal_wiper) + PLATE_LOAD;
-                    if r_to_gnd < 1.0 { 0.0 } else { (r_to_gnd * r_to_hot) / (r_to_gnd + r_to_hot) }
-                };
-                let bright_shunt = MIXING_R + bright_wiper_z;
-                let normal_shunt = MIXING_R + normal_wiper_z;
-
-                // Load at summing node = tone_stack_Z || opposing_channel_shunt
-                let normal_load_z = (TONE_Z * bright_shunt) / (TONE_Z + bright_shunt);
-                let bright_load_z = (TONE_Z * normal_shunt) / (TONE_Z + normal_shunt);
-
-                // Voltage divider: V_out/V_in = Z_load / (R_mixing + Z_load)
-                // Normal channel loaded by Bright's pot, Bright loaded by Normal's pot
-                let normal_atten = normal_load_z / (MIXING_R + normal_load_z);
-                let bright_atten = bright_load_z / (MIXING_R + bright_load_z);
-
-                // Apply volume pots (wiper fraction = voltage divider ratio) and mixing network attenuation
-                let v1a_signal = v1a_coupled * normal_wiper * normal_atten;
-                let v1b_signal = v1b_bright * bright_wiper * bright_atten;
-
-                // Sum at mixing node
-                signal = v1a_signal + v1b_signal;
-
-                // === TONE STACK (5E3 circuit-derived) ===
-                // Physics-based first-order RC filter from actual 5E3 component values.
-                // Transfer function: H(s) = k·(1+s·τ_z)/(1+s·τ_p)
-                // Source impedance set per-buffer from mixing resistor configuration.
-                // No manual compensation needed — circuit model handles frequency response.
-                self.tone_stack.update(tone, self.sample_rate);
-                signal = self.tone_stack.process(signal);
+                // === MNA MIXING + TONE NETWORK ===
+                // Unified 2nd-order MNA model of the complete 5E3 passive network:
+                //   volume pots -> 500pF bright cap -> 68kΩ mixing Rs -> tone pot + 4.7nF
+                //
+                // Controls: [normal_wiper, bright_wiper, tone] — all physical pot fractions.
+                // Two independent transfer functions are solved from the same netlist, one
+                // per input channel, then summed. This should capture:
+                //   • 500pF bright cap interaction with both volume pots and the tone circuit
+                //   • Frequency-dependent source impedance into the tone pot (not a fixed 34kΩ)
+                //   • HF shunt to ground when bright_vol = 0 (cap discharges through grounded wiper)
+                //   • Cross-channel loading at all frequencies, including HF via the bright cap
+                let controls = [normal_wiper as f64, bright_wiper as f64, tone as f64];
+                let controls_changed = controls.iter().zip(self.mixing_tone_controls.iter())
+                    .any(|(a, b)| (a - b).abs() > 0.001);
+                if controls_changed {
+                    self.mixing_tone_controls = controls;
+                    if let Ok(coeffs) = self.mna_normal.compute_coefficients(&controls) {
+                        self.filter_normal.set_analog_coefficients(&coeffs, self.sample_rate);
+                    }
+                    if let Ok(coeffs) = self.mna_bright.compute_coefficients(&controls) {
+                        self.filter_bright.set_analog_coefficients(&coeffs, self.sample_rate);
+                    }
+                }
+                // Channel mode: v1a_coupled / v1b_coupled are already zero for inactive channels.
+                // The 100kΩ plate load shunts in the netlist always model the correct AC loading.
+                signal = self.filter_normal.process(v1a_coupled)
+                       + self.filter_bright.process(v1b_coupled);
 
                 // === V2A Gain Stage (12AX7) — uses B+3 (preamp rail) ===
                 signal = self.v2a_tube.process(signal, preamp_bias_response.bias_voltage, b_plus_preamp);
