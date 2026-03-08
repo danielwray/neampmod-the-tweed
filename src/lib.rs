@@ -48,9 +48,11 @@ use neampmod_engine::{
     // Phase inverter
     PhaseInverter,
     PhaseInverterTopology,
-    // Speaker impedance
+    // Speaker impedance and dynamics
     SpeakerImpedanceCurve,
     SpeakerPreset,
+    SpeakerNormalizer,
+    SpeakerModel,
     // IR loader and convolver (as modules)
     ir_loader,
     ir_convolver,
@@ -137,6 +139,10 @@ struct TheTweedParams {
     /// Range: -24 dB to 0 dB for mixing headroom
     #[id = "output_trim"]
     pub output_trim_db: FloatParam,
+
+    /// IR file path - persisted with DAW session state
+    #[persist = "ir_path"]
+    pub ir_file_path: Arc<Mutex<String>>,
 }
 
 
@@ -206,7 +212,7 @@ impl Default for TheTweedParams {
             // Output calibration trim
             output_trim_db: FloatParam::new(
                 "Output Trim",
-                -18.0,  // Additional trim on top of engine's 0db pro_audio_headroom()
+                0.0,  // Additional trim on top of engine's 0db pro_audio_headroom()
                 FloatRange::Linear { min: -24.0, max: -3.0 },
             )
             .with_unit(" dB")
@@ -214,6 +220,9 @@ impl Default for TheTweedParams {
             .with_smoother(SmoothingStyle::Linear(5.0))
             .with_value_to_string(formatters::v2s_f32_rounded(1))
             .with_string_to_value(Arc::new(|s: &str| s.trim().parse().ok())),
+
+            // IR file path - persisted with DAW session
+            ir_file_path: Arc::new(Mutex::new("default.wav".to_string())),
         }
     }
 }
@@ -349,11 +358,13 @@ pub struct TheTweed {
     // === Speaker Impedance ===
     speaker_impedance: SpeakerImpedanceCurve,
 
-    // === IR Convolution ===
+    // === Speaker Normalizer (physical secondary volts → normalized ±1 for IR) ===
+    speaker_normalizer: SpeakerNormalizer,
+
+    // === IR Convolution (block-based, matched to DAW buffer size) ===
     ir_convolver: ir_convolver::ZeroLatencyConvolver,
-    ir_input_buffer: Vec<f32>,
-    ir_output_buffer: Vec<f32>,
-    ir_output_index: usize,
+    pre_ir_buffer: Vec<f32>,
+    post_ir_buffer: Vec<f32>,
     ir_block_size: usize,
 
     // PI-to-power interstage: separate per phase (each 6V6 has its own
@@ -367,7 +378,6 @@ pub struct TheTweed {
 
     // IR loading state (shared with GUI)
     ir_load_status: Arc<atomic::AtomicU8>,  // 0=pending, 1=success, 2=failed
-    ir_file_path: Arc<Mutex<String>>,
 }
 
 impl Default for TheTweed {
@@ -518,6 +528,8 @@ impl Default for TheTweed {
 
             speaker_impedance: build_speaker_impedance(sample_rate),
 
+            speaker_normalizer: SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP),
+
             // IR convolution - load and process embedded default.wav
             ir_convolver: {
                 let ir_loader = ir_loader::IrLoader::new(sample_rate);
@@ -536,16 +548,14 @@ impl Default for TheTweed {
                     }
                 }
             },
-            ir_input_buffer: Vec::with_capacity(512),
-            ir_output_buffer: vec![0.0; 512],
-            ir_output_index: 0,
+            pre_ir_buffer: vec![0.0; 512],
+            post_ir_buffer: vec![0.0; 512],
             ir_block_size: 512,
 
             dc_blocker_output: DCBlocker::new(sample_rate, 10.0),
 
             // IR loading state (shared with GUI)
             ir_load_status: Arc::new(atomic::AtomicU8::new(1)),  // Start with success (embedded IR)
-            ir_file_path: Arc::new(Mutex::new("default.wav".to_string())),
         }
     }
 }
@@ -565,12 +575,13 @@ impl TheTweed {
                 IrLoader::remove_dc_offset(&mut ir);
                 IrLoader::normalize_rms(&mut ir, -12.0);
 
-                // Create new convolver
-                self.ir_convolver = ZeroLatencyConvolver::new(&ir, 512, 128);
+                // Create new convolver matched to DAW buffer size
+                let fir_len = 128.min(self.ir_block_size);
+                self.ir_convolver = ZeroLatencyConvolver::new(&ir, self.ir_block_size, fir_len);
 
                 // Update status
                 self.ir_load_status.store(1, atomic::Ordering::Relaxed);
-                if let Ok(mut path_str) = self.ir_file_path.lock() {
+                if let Ok(mut path_str) = self.params.ir_file_path.lock() {
                     *path_str = path.display().to_string();
                 }
 
@@ -614,6 +625,11 @@ impl Plugin for TheTweed {
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         self.sample_rate = buffer_config.sample_rate;
+        self.ir_block_size = buffer_config.max_buffer_size as usize;
+
+        // Resize IR processing buffers to match DAW buffer size
+        self.pre_ir_buffer.resize(self.ir_block_size, 0.0);
+        self.post_ir_buffer.resize(self.ir_block_size, 0.0);
 
         // Initialize parameter smoothing
         self.params.bright_volume.smoothed.reset(self.params.bright_volume.value());
@@ -740,14 +756,43 @@ impl Plugin for TheTweed {
 
         self.output_transformer = OutputTransformer::from_type(self.sample_rate, TransformerType::SmallAmerican);
         self.speaker_impedance = build_speaker_impedance(self.sample_rate);
+        self.speaker_normalizer = SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP);
 
-        // Reload IR convolver with new sample rate
-        let ir_loader = ir_loader::IrLoader::new(self.sample_rate);
-        if let Ok((ir, _, _)) = ir_loader.load_from_bytes(CABINET_IR_BYTES) {
-            let mut processed_ir = ir;
-            ir_loader::IrLoader::remove_dc_offset(&mut processed_ir);
-            ir_loader::IrLoader::normalize_rms(&mut processed_ir, -12.0);
-            self.ir_convolver = ir_convolver::ZeroLatencyConvolver::new(&processed_ir, 512, 128);
+        // Reload IR convolver with new sample rate and DAW buffer size
+        // Check if a custom IR was persisted; if so, reload it from file
+        let persisted_ir_path = self.params.ir_file_path.lock()
+            .map(|p| p.clone())
+            .unwrap_or_else(|_| "default.wav".to_string());
+
+        let ir_reloaded = if persisted_ir_path != "default.wav" {
+            // Try to reload the custom IR from its original file path
+            let path = std::path::PathBuf::from(&persisted_ir_path);
+            if path.exists() {
+                self.load_ir_from_file(&path)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !ir_reloaded {
+            // Fall back to embedded default IR
+            let ir_loader = ir_loader::IrLoader::new(self.sample_rate);
+            if let Ok((ir, _, _)) = ir_loader.load_from_bytes(CABINET_IR_BYTES) {
+                let mut processed_ir = ir;
+                ir_loader::IrLoader::remove_dc_offset(&mut processed_ir);
+                ir_loader::IrLoader::normalize_rms(&mut processed_ir, -12.0);
+                let fir_len = 128.min(self.ir_block_size);
+                self.ir_convolver = ir_convolver::ZeroLatencyConvolver::new(&processed_ir, self.ir_block_size, fir_len);
+            }
+            // Reset path to default if custom failed to load
+            if persisted_ir_path != "default.wav" {
+                if let Ok(mut p) = self.params.ir_file_path.lock() {
+                    *p = "default.wav".to_string();
+                }
+                self.ir_load_status.store(2, atomic::Ordering::Relaxed);
+            }
         }
 
         self.dc_blocker_output = DCBlocker::new(self.sample_rate, 10.0);
@@ -804,10 +849,10 @@ impl Plugin for TheTweed {
 
         // Reset speaker impedance and IR convolver
         self.speaker_impedance.reset();
+        // speaker_normalizer is stateless — no reset needed
         self.ir_convolver.reset();
-        self.ir_input_buffer.clear();
-        self.ir_output_buffer.fill(0.0);
-        self.ir_output_index = 0;
+        self.pre_ir_buffer.fill(0.0);
+        self.post_ir_buffer.fill(0.0);
 
         self.dc_blocker_output.reset();
     }
@@ -820,7 +865,7 @@ impl Plugin for TheTweed {
     ) -> ProcessStatus {
         // Check for pending IR load (once per buffer)
         if self.ir_load_status.load(atomic::Ordering::Relaxed) == 0 {
-            let path_opt = self.ir_file_path.try_lock()
+            let path_opt = self.params.ir_file_path.try_lock()
                 .ok()
                 .map(|guard| std::path::PathBuf::from(guard.as_str()));
 
@@ -887,14 +932,20 @@ impl Plugin for TheTweed {
             self.v2a_tube.set_charge_fraction(charge_fraction);
         }
 
+        let num_samples = buffer.samples();
+        let power_on = self.params.power.value();
+        let mut sample_idx = 0usize;
+
+        // === PASS 1: Per-sample signal chain up to output transformer ===
         for channel_samples in buffer.iter_samples() {
             for sample in channel_samples {
-                let input = *sample;
-
-                if !self.params.power.value() {
-                    *sample = 0.0;
+                if !power_on {
+                    self.pre_ir_buffer[sample_idx] = 0.0;
+                    sample_idx += 1;
                     continue;
                 }
+
+                let input = *sample;
 
                 // === Get smoothed parameters ===
                 // Volume knob rotation (0-1 in perceptual/mechanical space)
@@ -906,7 +957,6 @@ impl Plugin for TheTweed {
                 let bright_wiper = self.volume_taper.wiper_fraction(bright_vol_raw);
                 let normal_wiper = self.volume_taper.wiper_fraction(normal_vol_raw);
                 let tone = self.params.tone.smoothed.next();
-                let master = self.params.master.smoothed.next();
                 let channel_mode = self.params.channel_select.value();
 
                 // === INPUT CALIBRATION ===
@@ -1051,45 +1101,50 @@ impl Plugin for TheTweed {
                 // === OUTPUT TRANSFORMER ===
                 signal = self.output_transformer.process(signal);
 
-                // === POST-OT: IR CONVOLUTION (block-based processing) ===
-                // Fill input buffer
-                self.ir_input_buffer.push(signal);
+                // === NORMALIZE SPEAKER (from voltage to -/+1.0 float range) ===
+                signal = self.speaker_normalizer.process(signal);
 
-                // Process when buffer is full
-                if self.ir_input_buffer.len() >= self.ir_block_size {
-                    // Ensure output buffer has correct size
-                    if self.ir_output_buffer.len() != self.ir_block_size {
-                        self.ir_output_buffer.resize(self.ir_block_size, 0.0);
-                    }
-                    // Process the block
-                    self.ir_convolver.process(&self.ir_input_buffer, &mut self.ir_output_buffer);
-                    self.ir_input_buffer.clear();
-                    self.ir_output_index = 0;
+                // Store pre-IR signal for block convolution
+                self.pre_ir_buffer[sample_idx] = signal;
+                sample_idx += 1;
+            }
+        }
+
+        // === PASS 2: Block IR convolution (zero-latency, matched to DAW buffer) ===
+        // Zero-pad if buffer is smaller than block_size (rare: end of offline render)
+        for i in num_samples..self.ir_block_size {
+            self.pre_ir_buffer[i] = 0.0;
+        }
+        self.ir_convolver.process(
+            &self.pre_ir_buffer[..self.ir_block_size],
+            &mut self.post_ir_buffer[..self.ir_block_size],
+        );
+
+        // === PASS 3: Post-IR processing (output cal, master, DC block) ===
+        {
+            let output_channel = &mut buffer.as_slice()[0];
+            for i in 0..num_samples {
+                if !power_on {
+                    output_channel[i] = 0.0;
+                    continue;
                 }
 
-                // Read from output buffer (or silence if block not yet processed)
-                signal = if self.ir_output_index < self.ir_output_buffer.len() {
-                    let out = self.ir_output_buffer[self.ir_output_index];
-                    self.ir_output_index += 1;
-                    out
-                } else {
-                    0.0
-                };
+                let mut signal = self.post_ir_buffer[i];
 
-                // === OUTPUT CALIBRATION ===
+                // Output calibration
                 signal = self.output_cal.process(signal);
-                // Apply user output trim
                 let output_trim = self.params.output_trim_db.smoothed.next();
                 signal *= neampmod_engine::db_to_linear(output_trim);
 
-                // === MASTER VOLUME ===
+                // Master volume
+                let master = self.params.master.smoothed.next();
                 let master_gain = master.powf(1.5);
                 signal *= master_gain;
 
                 // DC blocking and safety limiting
                 signal = self.dc_blocker_output.process(signal);
 
-                *sample = signal;
+                output_channel[i] = signal;
             }
         }
 
@@ -1114,7 +1169,7 @@ impl Plugin for TheTweed {
 
             let params = self.params.clone();
             let ir_status = self.ir_load_status.clone();
-            let ir_path = self.ir_file_path.clone();
+            let ir_path = self.params.ir_file_path.clone();
 
             create_egui_editor(
                 EguiState::from_size(800, 450),
