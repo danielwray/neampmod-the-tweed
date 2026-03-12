@@ -25,7 +25,6 @@ use neampmod_engine::{
     FilterCapSpec,
     FilterResistorSpec,
     ScreenGridSag,
-    crossover_distortion,
     // Bias modeling
     CathodeBias,
     CathodeBiasConfig,
@@ -43,8 +42,10 @@ use neampmod_engine::{
     // Calibration
     InputCalibration,
     OutputCalibration,
-    // Coupling capacitors
+    // Coupling capacitors and grid coupling
     CouplingCapacitor,
+    GridCouplingNetwork,
+    GridBiasType,
     // Phase inverter
     PhaseInverter,
     PhaseInverterTopology,
@@ -328,14 +329,17 @@ pub struct TheTweed {
     // Cathodyne phase inverter (V2B equivalent)
     phase_inverter: PhaseInverter,
 
-    // Coupling capacitors between stages (DC blocking + frequency shaping)
+    // Passive coupling capacitors (DC blocking, no grid conduction)
+    // V1 plate → volume/mixing network: 0.1µF into 1MΩ
     coupling_v1: CouplingCapacitor,
     coupling_v1b: CouplingCapacitor,
+    // V2A plate → PI grid: passive coupling (cathodyne PI cathode at ~165V,
+    // so V_gk ≈ -165V — grid conduction is physically impossible)
     coupling_v2a: CouplingCapacitor,
-    // PI-to-power coupling caps: one per phase (each power tube grid has its own
-    // 100nF coupling cap + 220kΩ grid leak in the 5E3 circuit)
-    coupling_power_pos: CouplingCapacitor,
-    coupling_power_neg: CouplingCapacitor,
+    // Grid coupling networks (DC blocking + nonlinear grid conduction)
+    // PI → 6V6 grids: 0.1µF, 220kΩ grid leak, 1.5kΩ grid stopper per phase
+    coupling_power_pos: GridCouplingNetwork,
+    coupling_power_neg: GridCouplingNetwork,
 
     // Push-pull power stage (two 6V6 tubes)
     power_tube_1: PowerTubeStage,
@@ -395,6 +399,22 @@ impl Default for TheTweed {
             charge_multiplier: 0.004,
             ..PreampTubeType::Triode12AX7.grid_config()
         };
+
+        // Create V2A and power tubes before struct literal to obtain ac_swing values
+        // for GridCouplingNetwork construction.
+        let v2a_tube = TubeStage::from_config(
+            sample_rate,
+            TubeStageConfig::new(PreampTubeType::Triode12AX7)
+                .with_plate_voltage_fraction(250.0 / 330.0)
+                .with_cathode_circuit(1500.0, Some(25.0)),
+        );
+
+        // Power tubes with internal grid model disabled (GridCouplingNetwork models it externally)
+        let mut power_tube_1 = PowerTubeStage::new(sample_rate, PowerTubeType::BeamTetrode6V6);
+        power_tube_1.disable_internal_grid_model();
+        let power_ac_swing = power_tube_1.voltage_cal().ac_swing;
+        let mut power_tube_2 = PowerTubeStage::new(sample_rate, PowerTubeType::BeamTetrode6V6);
+        power_tube_2.disable_internal_grid_model();
 
         Self {
             params: Arc::new(TheTweedParams::default()),
@@ -457,24 +477,28 @@ impl Default for TheTweed {
                     .with_grid_config(v1_grid_12ax7),
             ),
             // V2A (12AX7 gain stage) — 1500Ω cathode, 25µF bypass (fc≈4.2Hz, fully bypassed)
-            v2a_tube: TubeStage::from_config(
-                sample_rate,
-                TubeStageConfig::new(PreampTubeType::Triode12AX7)
-                    .with_plate_voltage_fraction(250.0 / 330.0)
-                    .with_cathode_circuit(1500.0, Some(25.0)),
-            ),
+            v2a_tube,
 
             phase_inverter: PhaseInverter::from_topology(sample_rate, PhaseInverterTopology::Cathodyne),
 
-            // 5E3 coupling capacitor values (exact schematic values)
-            // V1 -> volume: 0.1µF @ 400V into 1MΩ effective (volume pot + mixing + tone stack)
+            // Passive coupling caps (V1 plate → volume/mixing, no grid conduction)
             coupling_v1: CouplingCapacitor::new(sample_rate, 0.1e-6, 1_000_000.0),
             coupling_v1b: CouplingCapacitor::new(sample_rate, 0.1e-6, 1_000_000.0),
-            // V2A -> PI: 0.02µF @ 400V into 1MΩ PI grid leak (tighter bass, faster blocking recovery)
+            // V2A → PI: passive coupling (cathodyne PI grid never conducts — cathode at ~165V)
             coupling_v2a: CouplingCapacitor::new(sample_rate, 0.02e-6, 1_000_000.0),
-            // PI -> Power: 0.1µF into 220kΩ grid leaks
-            coupling_power_pos: CouplingCapacitor::new(sample_rate, 0.1e-6, 220_000.0),
-            coupling_power_neg: CouplingCapacitor::new(sample_rate, 0.1e-6, 220_000.0),
+            // Grid coupling: PI → 6V6 (cathode-biased, grid leak to ground)
+            coupling_power_pos: GridCouplingNetwork::from_power_tube(
+                sample_rate, PowerTubeType::BeamTetrode6V6,
+                0.1e-6, 220_000.0, 1_500.0,
+                GridBiasType::CathodeBias { cathode_voltage: 22.0 },
+                power_ac_swing,
+            ),
+            coupling_power_neg: GridCouplingNetwork::from_power_tube(
+                sample_rate, PowerTubeType::BeamTetrode6V6,
+                0.1e-6, 220_000.0, 1_500.0,
+                GridBiasType::CathodeBias { cathode_voltage: 22.0 },
+                power_ac_swing,
+            ),
 
             // 1.5kΩ grid stopper into 220kΩ 6V6 grid leak, ~150pF Miller cap
             // Separate per 6V6 — each power tube has its own grid stopper circuit
@@ -492,24 +516,9 @@ impl Default for TheTweed {
             // 5E3 volume pots: 1MΩ CTS 15A audio taper (both channels identical)
             volume_taper: PotTaperConfig::new(PotTaper::Audio15A),
 
-            power_tube_1: {
-                let mut tube = PowerTubeStage::new(sample_rate, PowerTubeType::BeamTetrode6V6);
-                tube.set_grid_config(sample_rate, GridCurrentConfig {
-                    coupling_cap: 100e-9,
-                    charge_multiplier: 0.006,
-                    ..PowerTubeType::BeamTetrode6V6.grid_config()
-                });
-                tube
-            },
-            power_tube_2: {
-                let mut tube = PowerTubeStage::new(sample_rate, PowerTubeType::BeamTetrode6V6);
-                tube.set_grid_config(sample_rate, GridCurrentConfig {
-                    coupling_cap: 100e-9,
-                    charge_multiplier: 0.006,
-                    ..PowerTubeType::BeamTetrode6V6.grid_config()
-                });
-                tube
-            },
+            // Power tubes: 6V6 with internal grid model disabled (GridCouplingNetwork handles it)
+            power_tube_1,
+            power_tube_2,
 
             screen_sag_1: ScreenGridSag::new(sample_rate, PowerTubeType::BeamTetrode6V6),
             screen_sag_2: ScreenGridSag::new(sample_rate, PowerTubeType::BeamTetrode6V6),
@@ -718,26 +727,31 @@ impl Plugin for TheTweed {
         self.pi_to_power_neg = InterstageAttenuator::with_grid_stopper(1500.0, 220_000.0, 150e-12);
         self.pi_to_power_neg.initialize(self.sample_rate);
 
-        // 5E3 coupling capacitor values
+        // Passive coupling caps (V1 plate → volume/mixing)
         self.coupling_v1 = CouplingCapacitor::new(self.sample_rate, 0.1e-6, 1_000_000.0);
         self.coupling_v1b = CouplingCapacitor::new(self.sample_rate, 0.1e-6, 1_000_000.0);
+        // V2A → PI: passive coupling (cathodyne PI grid never conducts)
         self.coupling_v2a = CouplingCapacitor::new(self.sample_rate, 0.02e-6, 1_000_000.0);
-        self.coupling_power_pos = CouplingCapacitor::new(self.sample_rate, 0.1e-6, 220_000.0);
-        self.coupling_power_neg = CouplingCapacitor::new(self.sample_rate, 0.1e-6, 220_000.0);
 
-        // Power tubes (6V6)
+        // Power tubes (6V6) — internal grid model disabled, GridCouplingNetwork handles it
         self.power_tube_1 = PowerTubeStage::new(self.sample_rate, PowerTubeType::BeamTetrode6V6);
-        self.power_tube_1.set_grid_config(self.sample_rate, GridCurrentConfig {
-            coupling_cap: 100e-9,
-            charge_multiplier: 0.006,
-            ..PowerTubeType::BeamTetrode6V6.grid_config()
-        });
+        self.power_tube_1.disable_internal_grid_model();
+        let power_ac_swing = self.power_tube_1.voltage_cal().ac_swing;
         self.power_tube_2 = PowerTubeStage::new(self.sample_rate, PowerTubeType::BeamTetrode6V6);
-        self.power_tube_2.set_grid_config(self.sample_rate, GridCurrentConfig {
-            coupling_cap: 100e-9,
-            charge_multiplier: 0.006,
-            ..PowerTubeType::BeamTetrode6V6.grid_config()
-        });
+        self.power_tube_2.disable_internal_grid_model();
+        // Grid coupling: PI → 6V6 (cathode-biased, grid leak to ground)
+        self.coupling_power_pos = GridCouplingNetwork::from_power_tube(
+            self.sample_rate, PowerTubeType::BeamTetrode6V6,
+            0.1e-6, 220_000.0, 1_500.0,
+            GridBiasType::CathodeBias { cathode_voltage: 22.0 },
+            power_ac_swing,
+        );
+        self.coupling_power_neg = GridCouplingNetwork::from_power_tube(
+            self.sample_rate, PowerTubeType::BeamTetrode6V6,
+            0.1e-6, 220_000.0, 1_500.0,
+            GridBiasType::CathodeBias { cathode_voltage: 22.0 },
+            power_ac_swing,
+        );
 
         self.screen_sag_1 = ScreenGridSag::new(self.sample_rate, PowerTubeType::BeamTetrode6V6);
         self.screen_sag_2 = ScreenGridSag::new(self.sample_rate, PowerTubeType::BeamTetrode6V6);
@@ -1047,16 +1061,11 @@ impl Plugin for TheTweed {
                 let pi_coupled_neg = self.coupling_power_neg.process(pi_output.negative);
 
                 // Phase Inverter to Power interstage attenuation (separate per 6V6)
-                let mut positive_phase = self.pi_to_power_pos.process(pi_coupled_pos);
-                let mut negative_phase = self.pi_to_power_neg.process(pi_coupled_neg);
+                let positive_phase = self.pi_to_power_pos.process(pi_coupled_pos);
+                let negative_phase = self.pi_to_power_neg.process(pi_coupled_neg);
 
                 // === PUSH-PULL 6V6 POWER STAGE — uses B+1 (power rail, highest voltage) ===
                 let power_bias_response = self.power_bias.process(positive_phase, 1.0);
-
-                if power_bias_response.crossover_distortion > 0.01 {
-                    positive_phase = crossover_distortion(positive_phase, power_bias_response.crossover_distortion, power_bias_response.sag_amount);
-                    negative_phase = crossover_distortion(negative_phase, power_bias_response.crossover_distortion, power_bias_response.sag_amount);
-                }
 
                 let tube_1_out = self.power_tube_1.process(positive_phase, power_bias_response.sag_amount, b_plus_power);
                 let tube_2_out = self.power_tube_2.process(negative_phase, power_bias_response.sag_amount, b_plus_power);
