@@ -1,70 +1,48 @@
 use nih_plug::prelude::*;
 use std::sync::{Arc, Mutex, atomic};
-use std::collections::HashMap;
 
 #[cfg(feature = "gui")]
 mod gui;
 
-// Import all DSP from neampmod-engine
+// Import DSP from neampmod-engine
 use neampmod_engine::{
-    // Tube modeling
+    // Tube modeling (preamp only — power section handled by AmpTopology)
     TubeStage,
     TubeStageConfig,
     PreampTubeType,
-    PowerTubeStage,
-    PowerTubeType,
     GridCurrentConfig,
-    // Power supply
-    PowerSupplySag,
-    PowerSupplySagConfig,
-    PowerSupplyRipple,
-    PowerSupplyRippleConfig,
-    PowerSupplyTopology,
-    FilterChainSpec,
-    FilterChainNodeSpec,
-    FilterCapSpec,
-    FilterResistorSpec,
-    ScreenGridSag,
-    // Bias modeling
+    // AmpTopology (replaces manual power section + power supply + speaker impedance)
+    AmpTopology,
+    AmpTopologyConfig,
+    // Bias modeling (preamp only — power tube bias handled by AmpTopology)
     CathodeBias,
     CathodeBiasConfig,
-    PowerTubeBias,
-    PowerTubeBiasConfig,
     // Filters
     DCBlocker,
     NthOrderTdfii,
     // MNA mixing + tone network
     MnaSystem,
     PassiveNetworkSpec,
-    // Output transformer
-    OutputTransformer,
-    TransformerType,
     // Calibration
     InputCalibration,
     OutputCalibration,
-    // Coupling capacitors and grid coupling
+    // Coupling capacitors (preamp only — PI-to-power coupling handled by AmpTopology)
     CouplingCapacitor,
-    GridCouplingNetwork,
-    GridBiasType,
-    // Phase inverter
-    PhaseInverter,
-    PhaseInverterTopology,
-    // Speaker impedance and dynamics
-    SpeakerImpedanceCurve,
-    SpeakerPreset,
+    // Speaker normalizer (domain transition, plugin-side)
     SpeakerNormalizer,
     SpeakerModel,
-    // IR loader and convolver (as modules)
+    // IR loader and convolver
     ir_loader,
     ir_convolver,
-    // Attenuation
-    InterstageAttenuator,
     // Pot taper modeling
     PotTaper,
     PotTaperConfig,
+    // Input jack modeling
+    JackInput,
 };
 
 // Embedded IR from assets/ir/default.wav (compiled into binary)
+// TODO: Replace this with a hihger quality generated IR file
 const CABINET_IR_BYTES: &[u8] = include_bytes!("../assets/ir/default.wav");
 
 /// Maps internal 0.0–1.0 parameter value to 5E3 faceplate numbering (1–12).
@@ -228,80 +206,25 @@ impl Default for TheTweedParams {
     }
 }
 
-/// Build speaker impedance curve for Jensen P12Q 1x12 open-back cabinet
-/// Jensen P12Q in open-back 1x12 configuration (vintage tweed amp style)
-fn build_speaker_impedance(sample_rate: f32) -> SpeakerImpedanceCurve {
-    let curve = SpeakerImpedanceCurve::from_preset(sample_rate, SpeakerPreset::JensenP12);
-    let mut config = curve.config().clone();
-    config.cabinet_factor = 0.75; // Open-back 1x12 reduces LF resonance
-    SpeakerImpedanceCurve::new(sample_rate, config)
-}
-
-/// Build 5E3 Tweed Deluxe power supply filter chain
+/// Build the 5E3 AmpTopology configuration.
 ///
-/// Real 5E3 topology:
-/// ```text
-/// 5Y3 Rectifier
-///   ↓
-/// B+1: 8µF/450V ─-> Power tube plates (via OT center tap)
-///   ↓ 5kΩ dropping resistor
-/// B+2: 8µF/450V ─-> Power tube screens
-///   ↓ 22kΩ dropping resistor
-/// B+3: 8µF/450V ─-> All preamp plates (V1A, V1B, V2A, V2B)
-/// ```
-///
-/// Voltage levels (approximate under load):
-/// - B+1: ~360-380V (highest, least filtered)
-/// - B+2: ~340-360V (5kΩ drop from B+1)
-/// - B+3: ~320-340V (22kΩ drop from B+2, most filtered)
-fn build_5e3_power_supply_spec() -> FilterChainSpec {
-    FilterChainSpec {
-        nodes: vec![
-            // B+1: First filter cap (power tube plates)
-            FilterChainNodeSpec::Capacitor(FilterCapSpec {
-                instance_id: "b1_8uf".to_string(),
-                capacitance_uf: 8.0,
-                voltage_rating: 450.0,
-            }),
-            // 5kΩ dropping resistor (B+1 -> B+2)
-            FilterChainNodeSpec::Resistor(FilterResistorSpec {
-                resistance_ohms: 5_000.0,
-            }),
-            // B+2: Second filter cap (power tube screens)
-            FilterChainNodeSpec::Capacitor(FilterCapSpec {
-                instance_id: "b2_8uf".to_string(),
-                capacitance_uf: 8.0,
-                voltage_rating: 450.0,
-            }),
-            // 22kΩ dropping resistor (B+2 -> B+3)
-            FilterChainNodeSpec::Resistor(FilterResistorSpec {
-                resistance_ohms: 22_000.0,
-            }),
-            // B+3: Third filter cap (all preamp stages)
-            FilterChainNodeSpec::Capacitor(FilterCapSpec {
-                instance_id: "b3_8uf".to_string(),
-                capacitance_uf: 8.0,
-                voltage_rating: 450.0,
-            }),
-        ],
-        b_plus_assignments: HashMap::from([
-            // TODO: look at how to map B+1/ B+2 to respective parts of the power tube circuit... (research if that makes sense)
-            // Power tubes use B+1 (highest voltage, least filtered)
-            ("power".to_string(), "b1_8uf".to_string()),
-            // All preamp stages use B+3 (lowest voltage, most filtered)
-            ("preamp".to_string(), "b3_8uf".to_string()),
-        ]),
-        // 5E3 nominal B+ from rectified 325-0-325 power transformer
-        nominal_b_plus_volts: 360.0,
-    }
+/// Uses the engine's fender_5e3() preset (cathodyne PI, 6V6 PP, SmallAmerican OT,
+/// 5Y3 rectifier, JensenP12 impedance with 0.75 open-back factor, 3-tap B+ topology)
+/// with current tracking enabled for authentic sag response.
+fn build_5e3_amp_topology_config() -> AmpTopologyConfig {
+    let mut config = AmpTopologyConfig::fender_5e3();
+    // Enable current-based sag tracking for more responsive feel
+    config.power_supply.sag = config.power_supply.sag.with_current_tracking(80.0);
+    config
 }
 
 pub struct TheTweed {
     params: Arc<TheTweedParams>,
     sample_rate: f32,
 
-    // === Calibration ===
+    // === Input ===
     input_cal: InputCalibration,
+    jack_input: JackInput,
     output_cal: OutputCalibration,
 
     // Unified MNA mixing + tone network (replaces BrightChannelFilter, manual mixing, ToneStack5E3)
@@ -313,9 +236,8 @@ pub struct TheTweed {
     filter_bright: NthOrderTdfii,
     mixing_tone_controls: [f64; 3],  // cached for change detection
 
-    // Tube bias modeling
+    // Preamp bias modeling (power tube bias handled by AmpTopology)
     preamp_bias: CathodeBias,
-    power_bias: PowerTubeBias,
 
     // Preamp tube stages (Koren physics-based LUTs)
     // V1A (Normal channel) — two halves of the same tube
@@ -326,41 +248,24 @@ pub struct TheTweed {
     v1b_tube_12ax7: TubeStage,  // 12AX7 second triode (V1b) - mod tube
     v2a_tube: TubeStage,        // 12AX7 Gain stage (V2a)
 
-    // Cathodyne phase inverter (V2B equivalent)
-    phase_inverter: PhaseInverter,
-
-    // Passive coupling capacitors (DC blocking, no grid conduction)
+    // Passive coupling capacitors (DC blocking, preamp only)
     // V1 plate → volume/mixing network: 0.1µF into 1MΩ
     coupling_v1: CouplingCapacitor,
     coupling_v1b: CouplingCapacitor,
     // V2A plate → PI grid: passive coupling (cathodyne PI cathode at ~165V,
     // so V_gk ≈ -165V — grid conduction is physically impossible)
     coupling_v2a: CouplingCapacitor,
-    // Grid coupling networks (DC blocking + nonlinear grid conduction)
-    // PI → 6V6 grids: 0.1µF, 220kΩ grid leak, 1.5kΩ grid stopper per phase
-    coupling_power_pos: GridCouplingNetwork,
-    coupling_power_neg: GridCouplingNetwork,
 
-    // Push-pull power stage (two 6V6 tubes)
-    power_tube_1: PowerTubeStage,
-    power_tube_2: PowerTubeStage,
-
-    // Screen grid sag (independent per push-pull tube)
-    screen_sag_1: ScreenGridSag,
-    screen_sag_2: ScreenGridSag,
-
-    // Power supply sag (5Y3 rectifier)
-    power_supply_sag: PowerSupplySag,
-    // B+ ripple injection (5Y3 mains ripple at 120Hz for 60Hz American mains)
-    power_supply_ripple: PowerSupplyRipple,
-    // Power supply topology (B+1, B+2, B+3 filter chain)
-    power_supply_topology: PowerSupplyTopology,
-
-    // Output transformer (Small American style for 5E3)
-    output_transformer: OutputTransformer,
-
-    // === Speaker Impedance ===
-    speaker_impedance: SpeakerImpedanceCurve,
+    // === AmpTopology: PI → power tubes → OT → speaker impedance ===
+    // Replaces manual power section wiring. Handles:
+    //   - Cathodyne Phase inverter
+    //   - PI / 6V6 coupling caps + interstage attenuation
+    //   - Push-pull 6V6 power tubes with screen sag + cathode bias
+    //   - Output transformer (SmallAmerican) with core saturation + leakage
+    //   - Speaker impedance EQ (JensenP12, open-back 0.75)
+    //   - Power supply (5Y3 sag + ripple + 3-tap B+ topology)
+    //   - All internal feedback loops (screen sag, cathode bias, sag→B+)
+    amp_topology: AmpTopology,
 
     // === Speaker Normalizer (physical secondary volts → normalized ±1 for IR) ===
     speaker_normalizer: SpeakerNormalizer,
@@ -370,11 +275,6 @@ pub struct TheTweed {
     pre_ir_buffer: Vec<f32>,
     post_ir_buffer: Vec<f32>,
     ir_block_size: usize,
-
-    // PI-to-power interstage: separate per phase (each 6V6 has its own
-    // 1.5kΩ grid stopper + 220kΩ grid leak + Miller capacitance path)
-    pi_to_power_pos: InterstageAttenuator,
-    pi_to_power_neg: InterstageAttenuator,
 
     // Volume pot taper (1MΩ 15A audio taper, same for both channels)
     volume_taper: PotTaperConfig,
@@ -388,7 +288,7 @@ impl Default for TheTweed {
     fn default() -> Self {
         let sample_rate = 48000.0;
 
-        // 5E3-specific grid config: 22nF coupling caps
+        // 5E3-specific grid config: 100nF coupling caps (real 5E3 V1→volume caps)
         let v1_grid_12ay7 = GridCurrentConfig {
             coupling_cap: 100e-9,
             charge_multiplier: 0.004,
@@ -400,27 +300,13 @@ impl Default for TheTweed {
             ..PreampTubeType::Triode12AX7.grid_config()
         };
 
-        // Create V2A and power tubes before struct literal to obtain ac_swing values
-        // for GridCouplingNetwork construction.
-        let v2a_tube = TubeStage::from_config(
-            sample_rate,
-            TubeStageConfig::new(PreampTubeType::Triode12AX7)
-                .with_plate_voltage_fraction(250.0 / 330.0)
-                .with_cathode_circuit(1500.0, Some(25.0)),
-        );
-
-        // Power tubes with internal grid model disabled (GridCouplingNetwork models it externally)
-        let mut power_tube_1 = PowerTubeStage::new(sample_rate, PowerTubeType::BeamTetrode6V6);
-        power_tube_1.disable_internal_grid_model();
-        let power_ac_swing = power_tube_1.voltage_cal().ac_swing;
-        let mut power_tube_2 = PowerTubeStage::new(sample_rate, PowerTubeType::BeamTetrode6V6);
-        power_tube_2.disable_internal_grid_model();
-
         Self {
             params: Arc::new(TheTweedParams::default()),
             sample_rate,
 
             input_cal: InputCalibration::amp_standard(),
+            // 5E3 hi input: no series grid stopper (68kΩ is on lo input only), 1MΩ grid leak
+            jack_input: JackInput::new(0.0, 1_000_000.0),
             output_cal: OutputCalibration::pro_audio_headroom(),
 
             // Full MNA model of the 5E3 mixing + tone passive network.
@@ -441,10 +327,6 @@ impl Default for TheTweed {
             mixing_tone_controls: [-1.0; 3],
 
             preamp_bias: CathodeBias::new(CathodeBiasConfig::fender_5e3()),
-            power_bias: PowerTubeBias::new_cathode(
-                CathodeBiasConfig::fender_5e3(),
-                PowerTubeBiasConfig::fender_5e3(),
-            ),
 
             // V1A (Normal channel) — 820Ω shared cathode, 25µF bypass (fc≈7.7Hz, fully bypassed)
             v1a_tube_12ay7: TubeStage::from_config(
@@ -477,65 +359,26 @@ impl Default for TheTweed {
                     .with_grid_config(v1_grid_12ax7),
             ),
             // V2A (12AX7 gain stage) — 1500Ω cathode, 25µF bypass (fc≈4.2Hz, fully bypassed)
-            v2a_tube,
-
-            phase_inverter: PhaseInverter::from_topology(sample_rate, PhaseInverterTopology::Cathodyne),
+            v2a_tube: TubeStage::from_config(
+                sample_rate,
+                TubeStageConfig::new(PreampTubeType::Triode12AX7)
+                    .with_plate_voltage_fraction(250.0 / 330.0)
+                    .with_cathode_circuit(1500.0, Some(25.0)),
+            ),
 
             // Passive coupling caps (V1 plate → volume/mixing, no grid conduction)
             coupling_v1: CouplingCapacitor::new(sample_rate, 0.1e-6, 1_000_000.0),
             coupling_v1b: CouplingCapacitor::new(sample_rate, 0.1e-6, 1_000_000.0),
             // V2A → PI: passive coupling (cathodyne PI grid never conducts — cathode at ~165V)
             coupling_v2a: CouplingCapacitor::new(sample_rate, 0.02e-6, 1_000_000.0),
-            // Grid coupling: PI → 6V6 (cathode-biased, grid leak to ground)
-            coupling_power_pos: GridCouplingNetwork::from_power_tube(
-                sample_rate, PowerTubeType::BeamTetrode6V6,
-                0.1e-6, 220_000.0, 1_500.0,
-                GridBiasType::CathodeBias { cathode_voltage: 22.0 },
-                power_ac_swing,
-            ),
-            coupling_power_neg: GridCouplingNetwork::from_power_tube(
-                sample_rate, PowerTubeType::BeamTetrode6V6,
-                0.1e-6, 220_000.0, 1_500.0,
-                GridBiasType::CathodeBias { cathode_voltage: 22.0 },
-                power_ac_swing,
-            ),
 
-            // 1.5kΩ grid stopper into 220kΩ 6V6 grid leak, ~150pF Miller cap
-            // Separate per 6V6 — each power tube has its own grid stopper circuit
-            pi_to_power_pos: {
-                let mut att = InterstageAttenuator::with_grid_stopper(1500.0, 220_000.0, 150e-12);
-                att.initialize(sample_rate);
-                att
-            },
-            pi_to_power_neg: {
-                let mut att = InterstageAttenuator::with_grid_stopper(1500.0, 220_000.0, 150e-12);
-                att.initialize(sample_rate);
-                att
-            },
+            // AmpTopology: PI → power tubes → OT → speaker impedance + power supply
+            // This uses the 5e3 preset in the engine (it is configurable so any topology, within
+            // reason can be passed in).. Smooth. Nice.
+            amp_topology: AmpTopology::new(sample_rate, build_5e3_amp_topology_config()),
 
             // 5E3 volume pots: 1MΩ CTS 15A audio taper (both channels identical)
             volume_taper: PotTaperConfig::new(PotTaper::Audio15A),
-
-            // Power tubes: 6V6 with internal grid model disabled (GridCouplingNetwork handles it)
-            power_tube_1,
-            power_tube_2,
-
-            screen_sag_1: ScreenGridSag::new(sample_rate, PowerTubeType::BeamTetrode6V6),
-            screen_sag_2: ScreenGridSag::new(sample_rate, PowerTubeType::BeamTetrode6V6),
-
-            power_supply_sag: PowerSupplySag::with_config(
-                sample_rate,
-                PowerSupplySagConfig::vintage_american().with_current_tracking(80.0),
-            ),
-            power_supply_ripple: PowerSupplyRipple::with_config(
-                sample_rate,
-                PowerSupplyRippleConfig::vintage_american(),
-            ),
-            power_supply_topology: PowerSupplyTopology::from_spec(&build_5e3_power_supply_spec()),
-
-            output_transformer: OutputTransformer::from_type(sample_rate, TransformerType::SmallAmerican),
-
-            speaker_impedance: build_speaker_impedance(sample_rate),
 
             speaker_normalizer: SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP),
 
@@ -667,7 +510,6 @@ impl Plugin for TheTweed {
 
         // Initialize bias modeling
         self.preamp_bias.initialize(self.sample_rate);
-        self.power_bias.initialize(self.sample_rate);
 
         // 5E3-specific grid configs
         let v1_grid_12ay7 = GridCurrentConfig {
@@ -719,57 +561,14 @@ impl Plugin for TheTweed {
                 .with_cathode_circuit(1500.0, Some(25.0)),
         );
 
-        self.phase_inverter = PhaseInverter::from_topology(self.sample_rate, PhaseInverterTopology::Cathodyne);
-        // 1.5kΩ grid stopper into 220kΩ 6V6 grid leak, ~150pF Miller cap
-        // Separate per 6V6 — each power tube has its own grid stopper circuit
-        self.pi_to_power_pos = InterstageAttenuator::with_grid_stopper(1500.0, 220_000.0, 150e-12);
-        self.pi_to_power_pos.initialize(self.sample_rate);
-        self.pi_to_power_neg = InterstageAttenuator::with_grid_stopper(1500.0, 220_000.0, 150e-12);
-        self.pi_to_power_neg.initialize(self.sample_rate);
-
         // Passive coupling caps (V1 plate → volume/mixing)
         self.coupling_v1 = CouplingCapacitor::new(self.sample_rate, 0.1e-6, 1_000_000.0);
         self.coupling_v1b = CouplingCapacitor::new(self.sample_rate, 0.1e-6, 1_000_000.0);
         // V2A → PI: passive coupling (cathodyne PI grid never conducts)
         self.coupling_v2a = CouplingCapacitor::new(self.sample_rate, 0.02e-6, 1_000_000.0);
 
-        // Power tubes (6V6) — internal grid model disabled, GridCouplingNetwork handles it
-        self.power_tube_1 = PowerTubeStage::new(self.sample_rate, PowerTubeType::BeamTetrode6V6);
-        self.power_tube_1.disable_internal_grid_model();
-        let power_ac_swing = self.power_tube_1.voltage_cal().ac_swing;
-        self.power_tube_2 = PowerTubeStage::new(self.sample_rate, PowerTubeType::BeamTetrode6V6);
-        self.power_tube_2.disable_internal_grid_model();
-        // Grid coupling: PI → 6V6 (cathode-biased, grid leak to ground)
-        self.coupling_power_pos = GridCouplingNetwork::from_power_tube(
-            self.sample_rate, PowerTubeType::BeamTetrode6V6,
-            0.1e-6, 220_000.0, 1_500.0,
-            GridBiasType::CathodeBias { cathode_voltage: 22.0 },
-            power_ac_swing,
-        );
-        self.coupling_power_neg = GridCouplingNetwork::from_power_tube(
-            self.sample_rate, PowerTubeType::BeamTetrode6V6,
-            0.1e-6, 220_000.0, 1_500.0,
-            GridBiasType::CathodeBias { cathode_voltage: 22.0 },
-            power_ac_swing,
-        );
-
-        self.screen_sag_1 = ScreenGridSag::new(self.sample_rate, PowerTubeType::BeamTetrode6V6);
-        self.screen_sag_2 = ScreenGridSag::new(self.sample_rate, PowerTubeType::BeamTetrode6V6);
-
-        self.power_supply_sag = PowerSupplySag::with_config(
-            self.sample_rate,
-            PowerSupplySagConfig::vintage_american().with_current_tracking(80.0),
-        );
-        self.power_supply_ripple = PowerSupplyRipple::with_config(
-            self.sample_rate,
-            PowerSupplyRippleConfig::vintage_american(),
-        );
-
-        // Reinitialize power supply topology
-        self.power_supply_topology = PowerSupplyTopology::from_spec(&build_5e3_power_supply_spec());
-
-        self.output_transformer = OutputTransformer::from_type(self.sample_rate, TransformerType::SmallAmerican);
-        self.speaker_impedance = build_speaker_impedance(self.sample_rate);
+        // Reinitialize AmpTopology (PI → power tubes → OT → impedance + power supply)
+        self.amp_topology = AmpTopology::new(self.sample_rate, build_5e3_amp_topology_config());
         self.speaker_normalizer = SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP);
 
         // Reload IR convolver with new sample rate and DAW buffer size
@@ -821,53 +620,36 @@ impl Plugin for TheTweed {
         self.params.tone.smoothed.reset(self.params.tone.value());
         self.params.master.smoothed.reset(self.params.master.value());
 
+        // Reset input jack
+        self.jack_input.reset();
+
         // Reset MNA mixing + tone filters
         self.filter_normal.reset();
         self.filter_bright.reset();
         self.mixing_tone_controls = [-1.0; 3];
 
-        // Reset bias modeling
+        // Reset preamp bias
         self.preamp_bias.reset();
-        self.power_bias.reset();
 
-        // Reset tube stages (both channels)
+        // Reset preamp tube stages
         self.v1a_tube_12ay7.reset();
         self.v1a_tube_12ax7.reset();
         self.v1b_tube_12ay7.reset();
         self.v1b_tube_12ax7.reset();
         self.v2a_tube.reset();
-        self.phase_inverter.reset();
-        self.power_tube_1.reset();
-        self.power_tube_2.reset();
 
-        // Reset coupling capacitors
+        // Reset preamp coupling capacitors
         self.coupling_v1.reset();
         self.coupling_v1b.reset();
         self.coupling_v2a.reset();
-        self.coupling_power_pos.reset();
-        self.coupling_power_neg.reset();
 
-        // Reset interstage attenuators (per-phase grid stopper filters)
-        self.pi_to_power_pos.reset();
-        self.pi_to_power_neg.reset();
+        // Reset AmpTopology (PI, power tubes, OT, power supply, speaker impedance)
+        self.amp_topology.reset();
 
-        // Reset screen grid sag
-        self.screen_sag_1.reset();
-        self.screen_sag_2.reset();
-
-        // Reset power supply, ripple, topology, and transformer
-        self.power_supply_sag.reset();
-        self.power_supply_ripple.reset();
-        self.power_supply_topology.reset();
-        self.output_transformer.reset();
-
-        // Reset speaker impedance and IR convolver
-        self.speaker_impedance.reset();
-        // speaker_normalizer is stateless — no reset needed
+        // Reset IR convolver and output
         self.ir_convolver.reset();
         self.pre_ir_buffer.fill(0.0);
         self.post_ir_buffer.fill(0.0);
-
         self.dc_blocker_output.reset();
     }
 
@@ -887,12 +669,6 @@ impl Plugin for TheTweed {
                 self.load_ir_from_file(&path);
             }
         }
-
-        // Reset power supply topology load tracking at start of buffer
-        self.power_supply_topology.reset_loads();
-        let mut power_current_accumulator = 0.0_f32;
-        let mut sample_count = 0_usize;
-
 
         // === V2A VARIABLE GRID LEAK (5E3 Cross-Channel Interaction) ===
         // In the 5E3, V2A has no dedicated grid leak resistor — the volume pots
@@ -946,11 +722,23 @@ impl Plugin for TheTweed {
             self.v2a_tube.set_charge_fraction(charge_fraction);
         }
 
+        // Propagate input jack series resistance to V1 grid current models.
+        // Z_source is currently fixed (no guitar volume param), so set once per buffer.
+        let grid_series_r = self.jack_input.source_series_resistance();
+        self.v1a_tube_12ay7.set_grid_series_resistance(grid_series_r);
+        self.v1a_tube_12ax7.set_grid_series_resistance(grid_series_r);
+        self.v1b_tube_12ay7.set_grid_series_resistance(grid_series_r);
+        self.v1b_tube_12ax7.set_grid_series_resistance(grid_series_r);
+
         let num_samples = buffer.samples();
         let power_on = self.params.power.value();
         let mut sample_idx = 0usize;
 
-        // === PASS 1: Per-sample signal chain up to output transformer ===
+        // === AmpTopology: begin buffer ===
+        // Routes impedance feedback from previous buffer, prepares power supply interpolation
+        self.amp_topology.begin_buffer(num_samples);
+
+        // === PASS 1: Per-sample signal chain ===
         for channel_samples in buffer.iter_samples() {
             for sample in channel_samples {
                 if !power_on {
@@ -961,13 +749,12 @@ impl Plugin for TheTweed {
 
                 let input = *sample;
 
+                // Advance power supply interpolation
+                self.amp_topology.advance_sample();
+
                 // === Get smoothed parameters ===
-                // Volume knob rotation (0-1 in perceptual/mechanical space)
                 let bright_vol_raw = self.params.bright_volume.smoothed.next();
                 let normal_vol_raw = self.params.normal_volume.smoothed.next();
-                // Convert to physical wiper fraction (0-1 in resistance space)
-                // 1MΩ 15A audio taper: 50% rotation -> 15% of resistance at wiper
-                // This single value drives both signal attenuation AND impedance
                 let bright_wiper = self.volume_taper.wiper_fraction(bright_vol_raw);
                 let normal_wiper = self.volume_taper.wiper_fraction(normal_vol_raw);
                 let tone = self.params.tone.smoothed.next();
@@ -975,29 +762,18 @@ impl Plugin for TheTweed {
 
                 // === INPUT CALIBRATION ===
                 let mut signal = self.input_cal.process(input);
-                // Apply user input trim
                 let input_trim = self.params.input_trim_db.smoothed.next();
                 signal *= neampmod_engine::db_to_linear(input_trim);
 
-                // === B+ SAG + RIPPLE ===
-                let sag_state = self.power_supply_sag.sag_state();
-                let ripple_mod = self.power_supply_ripple.process(sag_state);
+                // === INPUT JACK VOLTAGE DIVIDER ===
+                signal = self.jack_input.process(signal);
 
-                // 5E3 Power Supply Topology:
-                // - B+1 (highest voltage, least filtered) -> Power tubes
-                // - B+3 (lowest voltage, most filtered) -> All preamp stages
-                // Topology handles sag filtering internally (per-buffer RC lowpass).
-                // Ripple is applied per-sample on top of the topology's voltage.
-                let b_plus_preamp = self.power_supply_topology.b_plus_with_load("preamp") + ripple_mod;
-                let b_plus_power = self.power_supply_topology.b_plus_with_load("power") + ripple_mod;
+                // === B+ for preamp (from AmpTopology power supply) ===
+                let b_plus_preamp = self.amp_topology.b_plus_for_stage("preamp");
 
                 let preamp_bias_response = self.preamp_bias.process(signal, 1.0);
 
                 // === DUAL-CHANNEL PREAMP (V1A Normal + V1B Bright) ===
-                // Route input based on channel selector:
-                //   Normal: guitar -> V1A only
-                //   Both (jumpered): guitar -> V1A + V1B
-                //   Bright: guitar -> V1B only
                 let v1a_input = if channel_mode != ChannelMode::Bright { signal } else { 0.0 };
                 let v1b_input = if channel_mode != ChannelMode::Normal { signal } else { 0.0 };
 
@@ -1020,16 +796,6 @@ impl Plugin for TheTweed {
                 let v1b_coupled = self.coupling_v1b.process(v1b_out);
 
                 // === MNA MIXING + TONE NETWORK ===
-                // Unified 2nd-order MNA model of the complete 5E3 passive network:
-                //   volume pots -> 500pF bright cap -> 68kΩ mixing Rs -> tone pot + 4.7nF
-                //
-                // Controls: [normal_wiper, bright_wiper, tone] — all physical pot fractions.
-                // Two independent transfer functions are solved from the same netlist, one
-                // per input channel, then summed. This should capture:
-                //   • 500pF bright cap interaction with both volume pots and the tone circuit
-                //   • Frequency-dependent source impedance into the tone pot (not a fixed 34kΩ)
-                //   • HF shunt to ground when bright_vol = 0 (cap discharges through grounded wiper)
-                //   • Cross-channel loading at all frequencies, including HF via the bright cap
                 let controls = [normal_wiper as f64, bright_wiper as f64, tone as f64];
                 let controls_changed = controls.iter().zip(self.mixing_tone_controls.iter())
                     .any(|(a, b)| (a - b).abs() > 0.001);
@@ -1042,8 +808,6 @@ impl Plugin for TheTweed {
                         self.filter_bright.set_analog_coefficients(&coeffs, self.sample_rate);
                     }
                 }
-                // Channel mode: v1a_coupled / v1b_coupled are already zero for inactive channels.
-                // The 100kΩ plate load shunts in the netlist always model the correct AC loading.
                 signal = self.filter_normal.process(v1a_coupled)
                        + self.filter_bright.process(v1b_coupled);
 
@@ -1051,67 +815,14 @@ impl Plugin for TheTweed {
                 signal = self.v2a_tube.process(signal, preamp_bias_response.bias_voltage, b_plus_preamp);
                 signal = self.coupling_v2a.process(signal);
 
-                // === PHASE INVERTER (Cathodyne) ===
-                // V2A couples directly to PI through 0.02µF cap + 1MΩ grid leak
-                // No grid stopper between V2A and PI in the real 5E3 circuit
-                let pi_output = self.phase_inverter.process(signal);
+                // === POWER SECTION (PI → power tubes → OT → speaker impedance) ===
+                // AmpTopology handles: cathodyne PI, PI-to-6V6 coupling, push-pull 6V6,
+                // screen sag, cathode bias, OT (SmallAmerican), speaker impedance EQ,
+                // power supply sag driving.
+                let ot_volts = self.amp_topology.process_power_section(signal);
 
-                // PI coupling caps (100nF + 220kΩ grid leak per phase)
-                let pi_coupled_pos = self.coupling_power_pos.process(pi_output.positive);
-                let pi_coupled_neg = self.coupling_power_neg.process(pi_output.negative);
-
-                // Phase Inverter to Power interstage attenuation (separate per 6V6)
-                let positive_phase = self.pi_to_power_pos.process(pi_coupled_pos);
-                let negative_phase = self.pi_to_power_neg.process(pi_coupled_neg);
-
-                // === PUSH-PULL 6V6 POWER STAGE — uses B+1 (power rail, highest voltage) ===
-                let power_bias_response = self.power_bias.process(positive_phase, 1.0);
-
-                let tube_1_out = self.power_tube_1.process(positive_phase, power_bias_response.sag_amount, b_plus_power);
-                let tube_2_out = self.power_tube_2.process(negative_phase, power_bias_response.sag_amount, b_plus_power);
-
-                // Dynamic Miller capacitance: each power tube's gain modulates its own
-                // grid stopper filter (one-sample-delay pattern, per-tube independent)
-                let cgp = PowerTubeType::BeamTetrode6V6.cgp_pf();
-                let cgk = PowerTubeType::BeamTetrode6V6.cgk_pf();
-                self.pi_to_power_pos.update_miller_for_gain(
-                    self.power_tube_1.instantaneous_gain(), cgp, cgk,
-                );
-                self.pi_to_power_neg.update_miller_for_gain(
-                    self.power_tube_2.instantaneous_gain(), cgp, cgk,
-                );
-
-                // Accumulate power tube current for topology tracking (per buffer)
-                power_current_accumulator += (tube_1_out.abs() + tube_2_out.abs()) * 0.5;
-                sample_count += 1;
-
-                let screen_state_1 = self.screen_sag_1.process(tube_1_out.abs());
-                let screen_state_2 = self.screen_sag_2.process(tube_2_out.abs());
-                self.power_tube_1.set_screen_sag(screen_state_1);
-                self.power_tube_2.set_screen_sag(screen_state_2);
-
-                // Push-pull differential
-                let power_combined = tube_1_out - tube_2_out;
-
-                // === SPEAKER IMPEDANCE ===
-                let signal_with_impedance_eq = self.speaker_impedance.process_audio(power_combined);
-                let impedance_mods = self.speaker_impedance.get_modifiers();
-
-                // === POWER SUPPLY SAG (current-based tracking) ===
-                self.power_supply_sag.update_current(signal_with_impedance_eq);
-                let (_, _) = self.power_supply_sag.process_with_signal_and_impedance(
-                    signal_with_impedance_eq,
-                    0.5,
-                    impedance_mods.sag_mod,
-                );
-
-                signal = signal_with_impedance_eq;
-
-                // === OUTPUT TRANSFORMER ===
-                signal = self.output_transformer.process(signal);
-
-                // === NORMALIZE SPEAKER (from voltage to -/+1.0 float range) ===
-                signal = self.speaker_normalizer.process(signal);
+                // === NORMALIZE SPEAKER (physical OT secondary volts → ±1 for IR) ===
+                signal = self.speaker_normalizer.process(ot_volts);
 
                 // Store pre-IR signal for block convolution
                 self.pre_ir_buffer[sample_idx] = signal;
@@ -1119,8 +830,12 @@ impl Plugin for TheTweed {
             }
         }
 
+        // === AmpTopology: end buffer ===
+        // Updates tube load estimates for next buffer's power supply dynamics.
+        // Power tube current is tracked internally per-sample by process_power_section().
+        self.amp_topology.end_buffer(&[]);
+
         // === PASS 2: Block IR convolution (zero-latency, matched to DAW buffer) ===
-        // Zero-pad if buffer is smaller than block_size (rare: end of offline render)
         for i in num_samples..self.ir_block_size {
             self.pre_ir_buffer[i] = 0.0;
         }
@@ -1155,17 +870,6 @@ impl Plugin for TheTweed {
 
                 output_channel[i] = signal;
             }
-        }
-
-        // Update power supply topology with accumulated power tube current (per-buffer)
-        if sample_count > 0 {
-            // Average current over buffer, scale to amperes (approximate)
-            // Power tube current varies widely (idle ~20mA to peak ~100mA for 6V6)
-            // We scale the normalized output level to estimate current draw
-            let avg_current = (power_current_accumulator / sample_count as f32) * 0.001;
-            self.power_supply_topology.update_tube_load("power", avg_current);
-            let buffer_sag = self.power_supply_sag.sag_state();
-            self.power_supply_topology.process_dynamics(buffer_sag, sample_count, self.sample_rate);
         }
 
         ProcessStatus::Normal
