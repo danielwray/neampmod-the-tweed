@@ -8,9 +8,7 @@ mod gui;
 use neampmod_engine::{
     // Tube modeling (preamp only — power section handled by AmpTopology)
     TubeStage,
-    TubeStageConfig,
-    PreampTubeType,
-    GridCurrentConfig,
+    TubeRegistry,
     // AmpTopology (replaces manual power section + power supply + speaker impedance)
     AmpTopology,
     AmpTopologyConfig,
@@ -215,6 +213,13 @@ fn build_5e3_amp_topology_config() -> AmpTopologyConfig {
     let mut config = AmpTopologyConfig::fender_5e3();
     // Enable current-based sag tracking for more responsive feel
     config.power_supply.sag = config.power_supply.sag.with_current_tracking(80.0);
+    // Poweramps use a set of curves generated using the Koren model, plotted against a General Electric 6v6gt plate characteristic chart
+    // TODO: I need to add some additional data points before switching over to the spline-based 6v6gy as it's a bit noisy in testing
+    config.power_section.power_tube_spec = Some("6v6_5e3".into());
+    // Phase Inverter uses a set of curves generated using PCHIP, plotted against a General Eletrict 12ax7 plate characteristic chart
+    config.power_section.pi_spec = Some("ge_12ax7_cathodyne_56k".into());
+    // Rectifier uses a singular curve generated using the Koren model, plotted against a General Electric 5y3 plate characteristic chart
+    config.power_supply.sag.rectifier_spec = Some("5y3".into());
     config
 }
 
@@ -284,21 +289,28 @@ pub struct TheTweed {
     ir_load_status: Arc<atomic::AtomicU8>,  // 0=pending, 1=success, 2=failed
 }
 
+/// 5E3 preamp B+ voltage (from schematic — B+3 tap after filter chain)
+const PREAMP_BPLUS_5E3: f32 = 250.0;
+
+/// Build a preamp TubeStage from the registry with 5E3 plate voltage.
+fn build_preamp_tube(
+    sample_rate: f32,
+    spec_name: &str,
+    cathode_resistor_ohms: f32,
+    cathode_bypass_cap_uf: Option<f32>,
+) -> TubeStage {
+    let reg = TubeRegistry::global();
+    let spec = reg.lookup(spec_name)
+        .unwrap_or_else(|| panic!("Tube spec '{}' not found in registry", spec_name));
+    let mut stage = TubeStage::from_spec(sample_rate, spec, cathode_resistor_ohms, cathode_bypass_cap_uf)
+        .unwrap_or_else(|e| panic!("Failed to build tube from spec '{}': {}", spec_name, e));
+    stage.set_plate_bplus_voltage(PREAMP_BPLUS_5E3);
+    stage
+}
+
 impl Default for TheTweed {
     fn default() -> Self {
         let sample_rate = 48000.0;
-
-        // 5E3-specific grid config: 100nF coupling caps (real 5E3 V1→volume caps)
-        let v1_grid_12ay7 = GridCurrentConfig {
-            coupling_cap: 100e-9,
-            charge_multiplier: 0.004,
-            ..PreampTubeType::Triode12AY7.grid_config()
-        };
-        let v1_grid_12ax7 = GridCurrentConfig {
-            coupling_cap: 100e-9,
-            charge_multiplier: 0.004,
-            ..PreampTubeType::Triode12AX7.grid_config()
-        };
 
         Self {
             params: Arc::new(TheTweedParams::default()),
@@ -329,42 +341,15 @@ impl Default for TheTweed {
             preamp_bias: CathodeBias::new(CathodeBiasConfig::fender_5e3()),
 
             // V1A (Normal channel) — 820Ω shared cathode, 25µF bypass (fc≈7.7Hz, fully bypassed)
-            v1a_tube_12ay7: TubeStage::from_config(
-                sample_rate,
-                TubeStageConfig::new(PreampTubeType::Triode12AY7)
-                    .with_plate_voltage_fraction(250.0 / 330.0)
-                    .with_cathode_circuit(820.0, Some(25.0))
-                    .with_grid_config(v1_grid_12ay7.clone()),
-            ),
-            v1a_tube_12ax7: TubeStage::from_config(
-                sample_rate,
-                TubeStageConfig::new(PreampTubeType::Triode12AX7)
-                    .with_plate_voltage_fraction(250.0 / 330.0)
-                    .with_cathode_circuit(820.0, Some(25.0))
-                    .with_grid_config(v1_grid_12ax7.clone()),
-            ),
+            // v1a/v1b/v2a tubes all use LUTs generated using the PCHIP approach and are all
+            // based off of General Eletric charts
+            v1a_tube_12ay7: build_preamp_tube(sample_rate, "ge_12ay7_100k", 820.0, Some(25.0)),
+            v1a_tube_12ax7: build_preamp_tube(sample_rate, "ge_12ax7_100k", 820.0, Some(25.0)),
             // V1B (Bright channel) — same physical tube, shared cathode
-            v1b_tube_12ay7: TubeStage::from_config(
-                sample_rate,
-                TubeStageConfig::new(PreampTubeType::Triode12AY7)
-                    .with_plate_voltage_fraction(250.0 / 330.0)
-                    .with_cathode_circuit(820.0, Some(25.0))
-                    .with_grid_config(v1_grid_12ay7),
-            ),
-            v1b_tube_12ax7: TubeStage::from_config(
-                sample_rate,
-                TubeStageConfig::new(PreampTubeType::Triode12AX7)
-                    .with_plate_voltage_fraction(250.0 / 330.0)
-                    .with_cathode_circuit(820.0, Some(25.0))
-                    .with_grid_config(v1_grid_12ax7),
-            ),
+            v1b_tube_12ay7: build_preamp_tube(sample_rate, "ge_12ay7_100k", 820.0, Some(25.0)),
+            v1b_tube_12ax7: build_preamp_tube(sample_rate, "ge_12ax7_100k", 820.0, Some(25.0)),
             // V2A (12AX7 gain stage) — 1500Ω cathode, 25µF bypass (fc≈4.2Hz, fully bypassed)
-            v2a_tube: TubeStage::from_config(
-                sample_rate,
-                TubeStageConfig::new(PreampTubeType::Triode12AX7)
-                    .with_plate_voltage_fraction(250.0 / 330.0)
-                    .with_cathode_circuit(1500.0, Some(25.0)),
-            ),
+            v2a_tube: build_preamp_tube(sample_rate, "ge_12ax7_100k", 1500.0, Some(25.0)),
 
             // Passive coupling caps (V1 plate → volume/mixing, no grid conduction)
             coupling_v1: CouplingCapacitor::new(sample_rate, 0.1e-6, 1_000_000.0),
@@ -415,7 +400,6 @@ impl Default for TheTweed {
 impl TheTweed {
     /// Load IR from file path
     /// Returns true if successful
-    // TODO: Identify why loading sometimes takes to attempts
     pub fn load_ir_from_file(&mut self, path: &std::path::Path) -> bool {
         use neampmod_engine::{ir_loader::IrLoader, ir_convolver::ZeroLatencyConvolver};
 
@@ -511,55 +495,14 @@ impl Plugin for TheTweed {
         // Initialize bias modeling
         self.preamp_bias.initialize(self.sample_rate);
 
-        // 5E3-specific grid configs
-        let v1_grid_12ay7 = GridCurrentConfig {
-            coupling_cap: 100e-9,
-            charge_multiplier: 0.004,
-            ..PreampTubeType::Triode12AY7.grid_config()
-        };
-        let v1_grid_12ax7 = GridCurrentConfig {
-            coupling_cap: 100e-9,
-            charge_multiplier: 0.004,
-            ..PreampTubeType::Triode12AX7.grid_config()
-        };
-
         // V1A (Normal) — 820Ω shared cathode, 25µF bypass (fc≈7.7Hz)
-        self.v1a_tube_12ay7 = TubeStage::from_config(
-            self.sample_rate,
-            TubeStageConfig::new(PreampTubeType::Triode12AY7)
-                .with_plate_voltage_fraction(250.0 / 330.0)
-                .with_cathode_circuit(820.0, Some(25.0))
-                .with_grid_config(v1_grid_12ay7.clone()),
-        );
-        self.v1a_tube_12ax7 = TubeStage::from_config(
-            self.sample_rate,
-            TubeStageConfig::new(PreampTubeType::Triode12AX7)
-                .with_plate_voltage_fraction(250.0 / 330.0)
-                .with_cathode_circuit(820.0, Some(25.0))
-                .with_grid_config(v1_grid_12ax7.clone()),
-        );
+        self.v1a_tube_12ay7 = build_preamp_tube(self.sample_rate, "ge_12ay7_100k", 820.0, Some(25.0));
+        self.v1a_tube_12ax7 = build_preamp_tube(self.sample_rate, "ge_12ax7_100k", 820.0, Some(25.0));
         // V1B (Bright) — same physical tube, shared cathode
-        self.v1b_tube_12ay7 = TubeStage::from_config(
-            self.sample_rate,
-            TubeStageConfig::new(PreampTubeType::Triode12AY7)
-                .with_plate_voltage_fraction(250.0 / 330.0)
-                .with_cathode_circuit(820.0, Some(25.0))
-                .with_grid_config(v1_grid_12ay7),
-        );
-        self.v1b_tube_12ax7 = TubeStage::from_config(
-            self.sample_rate,
-            TubeStageConfig::new(PreampTubeType::Triode12AX7)
-                .with_plate_voltage_fraction(250.0 / 330.0)
-                .with_cathode_circuit(820.0, Some(25.0))
-                .with_grid_config(v1_grid_12ax7),
-        );
+        self.v1b_tube_12ay7 = build_preamp_tube(self.sample_rate, "ge_12ay7_100k", 820.0, Some(25.0));
+        self.v1b_tube_12ax7 = build_preamp_tube(self.sample_rate, "ge_12ax7_100k", 820.0, Some(25.0));
         // V2A (12AX7 gain stage) — 1500Ω cathode, 25µF bypass (fc≈4.2Hz)
-        self.v2a_tube = TubeStage::from_config(
-            self.sample_rate,
-            TubeStageConfig::new(PreampTubeType::Triode12AX7)
-                .with_plate_voltage_fraction(250.0 / 330.0)
-                .with_cathode_circuit(1500.0, Some(25.0)),
-        );
+        self.v2a_tube = build_preamp_tube(self.sample_rate, "ge_12ax7_100k", 1500.0, Some(25.0));
 
         // Passive coupling caps (V1 plate → volume/mixing)
         self.coupling_v1 = CouplingCapacitor::new(self.sample_rate, 0.1e-6, 1_000_000.0);
