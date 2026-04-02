@@ -24,6 +24,8 @@ use neampmod_engine::{
     // Calibration
     InputCalibration,
     OutputCalibration,
+    // Input level metering
+    InputLevelMeter,
     // Coupling capacitors (preamp only — PI-to-power coupling handled by AmpTopology)
     CouplingCapacitor,
     // Speaker normalizer (domain transition, plugin-side)
@@ -98,8 +100,7 @@ struct TheTweedParams {
     #[id = "power"]
     pub power: BoolParam,
 
-    /// V1 tube toggle - switches between 12AY7 (off) and 12AX7 (on)
-    /// Real-world mod: 12AX7 provides more gain and earlier breakup
+    /// V1 tube toggle - switches between stock tube (off) and mod tube (on)
     #[id = "tube_toggle"]
     pub tube_toggle: BoolParam,
 
@@ -161,7 +162,7 @@ impl Default for TheTweedParams {
 
             power: BoolParam::new("Power", true),
 
-            // Tube toggle - switches V1 between 12AY7 (stock) and 12AX7 (mod)
+            // Tube toggle - switches V1 between stock and mod
             tube_toggle: BoolParam::new("Tube Toggle", false),
 
             // Master volume - final output level control
@@ -213,13 +214,9 @@ fn build_5e3_amp_topology_config() -> AmpTopologyConfig {
     let mut config = AmpTopologyConfig::fender_5e3();
     // Enable current-based sag tracking for more responsive feel
     config.power_supply.sag = config.power_supply.sag.with_current_tracking(80.0);
-    // Poweramps use a set of curves generated using the Koren model, plotted against a General Electric 6v6gt plate characteristic chart
-    // TODO: I need to add some additional data points before switching over to the spline-based 6v6gy as it's a bit noisy in testing
-    config.power_section.power_tube_spec = Some("6v6_5e3".into());
-    // Phase Inverter uses a set of curves generated using PCHIP, plotted against a General Eletrict 12ax7 plate characteristic chart
-    config.power_section.pi_spec = Some("ge_12ax7_cathodyne_56k".into());
-    // Rectifier uses a singular curve generated using the Koren model, plotted against a General Electric 5y3 plate characteristic chart
-    config.power_supply.sag.rectifier_spec = Some("5y3".into());
+    config.power_section.power_tube_spec = Some(POWER_TUBE_SPEC.into());
+    config.power_section.pi_spec = Some(PI_SPEC.into());
+    config.power_supply.sag.rectifier_spec = Some(RECTIFIER_SPEC.into());
     config
 }
 
@@ -246,12 +243,12 @@ pub struct TheTweed {
 
     // Preamp tube stages (Koren physics-based LUTs)
     // V1A (Normal channel) — two halves of the same tube
-    v1a_tube_12ay7: TubeStage,  // 12AY7 first triode (V1a) - stock tube
-    v1a_tube_12ax7: TubeStage,  // 12AX7 first triode (V1a) - mod tube
+    v1a_tube_stock: TubeStage,
+    v1a_tube_mod: TubeStage,
     // V1B (Bright channel) — other half of V1
-    v1b_tube_12ay7: TubeStage,  // 12AY7 second triode (V1b) - stock tube
-    v1b_tube_12ax7: TubeStage,  // 12AX7 second triode (V1b) - mod tube
-    v2a_tube: TubeStage,        // 12AX7 Gain stage (V2a)
+    v1b_tube_stock: TubeStage,
+    v1b_tube_mod: TubeStage,
+    v2a_tube: TubeStage,
 
     // Passive coupling capacitors (DC blocking, preamp only)
     // V1 plate → volume/mixing network: 0.1µF into 1MΩ
@@ -285,12 +282,45 @@ pub struct TheTweed {
     volume_taper: PotTaperConfig,
     dc_blocker_output: DCBlocker,
 
+    // Input level meter (measures raw DAW signal, classifies operating zone)
+    input_meter: InputLevelMeter,
+    cached_input_trim_db: f32,
+    cached_tube_toggle: bool,
+
+    // Shared with GUI (written once per buffer from audio thread)
+    meter_peak_volts: Arc<atomic_float::AtomicF32>,
+
     // IR loading state (shared with GUI)
     ir_load_status: Arc<atomic::AtomicU8>,  // 0=pending, 1=success, 2=failed
 }
 
-/// 5E3 preamp B+ voltage (from schematic — B+3 tap after filter chain)
+// -- Power Supply ---
+/// 5E3 preamp B+ voltage (B+3 tap after filter chain)
 const PREAMP_BPLUS_5E3: f32 = 250.0;
+
+// --- Tubes ---
+/// V1 stock tube — General Electric 12ay7
+const V1_STOCK_SPEC: &str = "ge_12ay7_100k";
+/// V1 mod tube — RCA 12AX7A
+const V1_MOD_SPEC: &str = "rca_12ax7a_100k";
+/// V2A gain stage — RCA 12ax7A
+const V2A_SPEC: &str = "rca_12ax7a_100k";
+/// Phase inverter — General Electric 12ax7 cathodyne
+const PI_SPEC: &str = "ge_12ax7_cathodyne_56k";
+/// Power tubes — RCA 6V6GTA configured for 5E3
+const POWER_TUBE_SPEC: &str = "rca_6v6gta_5e3";
+/// Rectifier — 5Y3
+const RECTIFIER_SPEC: &str = "5y3";
+
+// --- 5E3 cathode circuit values ---
+/// V1 shared cathode resistor (Ω)
+const V1_CATHODE_R: f32 = 820.0;
+/// V1 cathode bypass cap (µF)
+const V1_CATHODE_CAP: f32 = 25.0;
+/// V2A cathode resistor (Ω)
+const V2A_CATHODE_R: f32 = 1500.0;
+/// V2A cathode bypass cap (µF)
+const V2A_CATHODE_CAP: f32 = 25.0;
 
 /// Build a preamp TubeStage from the registry with 5E3 plate voltage.
 fn build_preamp_tube(
@@ -308,17 +338,34 @@ fn build_preamp_tube(
     stage
 }
 
+/// Compute the meter ceiling at the amp jack for a given V1 tube stage.
+/// ceiling = clean_ac_ceiling_volts / jack.dc_gain()
+fn meter_ceiling_for_tube(tube: &TubeStage, jack: &JackInput) -> f32 {
+    tube.voltage_cal().clean_ac_ceiling_volts() / jack.dc_gain()
+}
+
 impl Default for TheTweed {
     fn default() -> Self {
         let sample_rate = 48000.0;
+
+        // Build input chain components first — meter needs references to these
+        let input_cal = InputCalibration::amp_standard();
+        let jack_input = JackInput::new(0.0, 1_000_000.0);
+
+        // V1 tubes — build before struct so meter can read ceiling from stock tube
+        let v1a_tube_stock = build_preamp_tube(sample_rate, V1_STOCK_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
+        let v1a_tube_mod = build_preamp_tube(sample_rate, V1_MOD_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
+
+        // Input meter — default tube_toggle=false, so use 12AY7 ceiling
+        let meter_ceiling = meter_ceiling_for_tube(&v1a_tube_stock, &jack_input);
+        let input_meter = InputLevelMeter::new(sample_rate, input_cal.input_scale(), meter_ceiling);
 
         Self {
             params: Arc::new(TheTweedParams::default()),
             sample_rate,
 
-            input_cal: InputCalibration::amp_standard(),
-            // 5E3 hi input: no series grid stopper (68kΩ is on lo input only), 1MΩ grid leak
-            jack_input: JackInput::new(0.0, 1_000_000.0),
+            input_cal,
+            jack_input,
             output_cal: OutputCalibration::pro_audio_headroom(),
 
             // Full MNA model of the 5E3 mixing + tone passive network.
@@ -340,16 +387,14 @@ impl Default for TheTweed {
 
             preamp_bias: CathodeBias::new(CathodeBiasConfig::fender_5e3()),
 
-            // V1A (Normal channel) — 820Ω shared cathode, 25µF bypass (fc≈7.7Hz, fully bypassed)
-            // v1a/v1b/v2a tubes all use LUTs generated using the PCHIP approach and are all
-            // based off of General Eletric charts
-            v1a_tube_12ay7: build_preamp_tube(sample_rate, "ge_12ay7_100k", 820.0, Some(25.0)),
-            v1a_tube_12ax7: build_preamp_tube(sample_rate, "ge_12ax7_100k", 820.0, Some(25.0)),
+            // V1A (Normal channel)
+            v1a_tube_stock,
+            v1a_tube_mod,
             // V1B (Bright channel) — same physical tube, shared cathode
-            v1b_tube_12ay7: build_preamp_tube(sample_rate, "ge_12ay7_100k", 820.0, Some(25.0)),
-            v1b_tube_12ax7: build_preamp_tube(sample_rate, "ge_12ax7_100k", 820.0, Some(25.0)),
-            // V2A (12AX7 gain stage) — 1500Ω cathode, 25µF bypass (fc≈4.2Hz, fully bypassed)
-            v2a_tube: build_preamp_tube(sample_rate, "ge_12ax7_100k", 1500.0, Some(25.0)),
+            v1b_tube_stock: build_preamp_tube(sample_rate, V1_STOCK_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP)),
+            v1b_tube_mod: build_preamp_tube(sample_rate, V1_MOD_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP)),
+            // V2A (gain stage)
+            v2a_tube: build_preamp_tube(sample_rate, V2A_SPEC, V2A_CATHODE_R, Some(V2A_CATHODE_CAP)),
 
             // Passive coupling caps (V1 plate → volume/mixing, no grid conduction)
             coupling_v1: CouplingCapacitor::new(sample_rate, 0.1e-6, 1_000_000.0),
@@ -390,6 +435,14 @@ impl Default for TheTweed {
             ir_block_size: 512,
 
             dc_blocker_output: DCBlocker::new(sample_rate, 10.0),
+
+            // Input level meter
+            input_meter,
+            cached_input_trim_db: 0.0,
+            cached_tube_toggle: false,
+
+            // Shared meter state (written by audio thread, read by GUI)
+            meter_peak_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
 
             // IR loading state (shared with GUI)
             ir_load_status: Arc::new(atomic::AtomicU8::new(1)),  // Start with success (embedded IR)
@@ -495,14 +548,14 @@ impl Plugin for TheTweed {
         // Initialize bias modeling
         self.preamp_bias.initialize(self.sample_rate);
 
-        // V1A (Normal) — 820Ω shared cathode, 25µF bypass (fc≈7.7Hz)
-        self.v1a_tube_12ay7 = build_preamp_tube(self.sample_rate, "ge_12ay7_100k", 820.0, Some(25.0));
-        self.v1a_tube_12ax7 = build_preamp_tube(self.sample_rate, "ge_12ax7_100k", 820.0, Some(25.0));
+        // V1A (Normal)
+        self.v1a_tube_stock = build_preamp_tube(self.sample_rate, V1_STOCK_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
+        self.v1a_tube_mod = build_preamp_tube(self.sample_rate, V1_MOD_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
         // V1B (Bright) — same physical tube, shared cathode
-        self.v1b_tube_12ay7 = build_preamp_tube(self.sample_rate, "ge_12ay7_100k", 820.0, Some(25.0));
-        self.v1b_tube_12ax7 = build_preamp_tube(self.sample_rate, "ge_12ax7_100k", 820.0, Some(25.0));
-        // V2A (12AX7 gain stage) — 1500Ω cathode, 25µF bypass (fc≈4.2Hz)
-        self.v2a_tube = build_preamp_tube(self.sample_rate, "ge_12ax7_100k", 1500.0, Some(25.0));
+        self.v1b_tube_stock = build_preamp_tube(self.sample_rate, V1_STOCK_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
+        self.v1b_tube_mod = build_preamp_tube(self.sample_rate, V1_MOD_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
+        // V2A (gain stage)
+        self.v2a_tube = build_preamp_tube(self.sample_rate, V2A_SPEC, V2A_CATHODE_R, Some(V2A_CATHODE_CAP));
 
         // Passive coupling caps (V1 plate → volume/mixing)
         self.coupling_v1 = CouplingCapacitor::new(self.sample_rate, 0.1e-6, 1_000_000.0);
@@ -553,6 +606,20 @@ impl Plugin for TheTweed {
 
         self.dc_blocker_output = DCBlocker::new(self.sample_rate, 10.0);
 
+        // Sync input trim into InputCalibration and rebuild meter
+        let trim_db = self.params.input_trim_db.value();
+        self.input_cal.set_user_trim_db(trim_db);
+        self.cached_input_trim_db = trim_db;
+        let tube_toggle = self.params.tube_toggle.value();
+        self.cached_tube_toggle = tube_toggle;
+        let v1_tube = if tube_toggle { &self.v1a_tube_mod } else { &self.v1a_tube_stock };
+        let ceiling = meter_ceiling_for_tube(v1_tube, &self.jack_input);
+        self.input_meter = InputLevelMeter::new(
+            self.sample_rate,
+            self.input_cal.input_scale(),
+            ceiling,
+        );
+
         true
     }
 
@@ -575,10 +642,10 @@ impl Plugin for TheTweed {
         self.preamp_bias.reset();
 
         // Reset preamp tube stages
-        self.v1a_tube_12ay7.reset();
-        self.v1a_tube_12ax7.reset();
-        self.v1b_tube_12ay7.reset();
-        self.v1b_tube_12ax7.reset();
+        self.v1a_tube_stock.reset();
+        self.v1a_tube_mod.reset();
+        self.v1b_tube_stock.reset();
+        self.v1b_tube_mod.reset();
         self.v2a_tube.reset();
 
         // Reset preamp coupling capacitors
@@ -594,6 +661,9 @@ impl Plugin for TheTweed {
         self.pre_ir_buffer.fill(0.0);
         self.post_ir_buffer.fill(0.0);
         self.dc_blocker_output.reset();
+
+        // Reset input meter
+        self.input_meter.reset();
     }
 
     fn process(
@@ -668,14 +738,30 @@ impl Plugin for TheTweed {
         // Propagate input jack series resistance to V1 grid current models.
         // Z_source is currently fixed (no guitar volume param), so set once per buffer.
         let grid_series_r = self.jack_input.source_series_resistance();
-        self.v1a_tube_12ay7.set_grid_series_resistance(grid_series_r);
-        self.v1a_tube_12ax7.set_grid_series_resistance(grid_series_r);
-        self.v1b_tube_12ay7.set_grid_series_resistance(grid_series_r);
-        self.v1b_tube_12ax7.set_grid_series_resistance(grid_series_r);
+        self.v1a_tube_stock.set_grid_series_resistance(grid_series_r);
+        self.v1a_tube_mod.set_grid_series_resistance(grid_series_r);
+        self.v1b_tube_stock.set_grid_series_resistance(grid_series_r);
+        self.v1b_tube_mod.set_grid_series_resistance(grid_series_r);
 
         let num_samples = buffer.samples();
         let power_on = self.params.power.value();
         let mut sample_idx = 0usize;
+
+        // === INPUT TRIM → InputCalibration (once per buffer, change-detected) ===
+        let current_trim_db = self.params.input_trim_db.value();
+        if (current_trim_db - self.cached_input_trim_db).abs() > 0.01 {
+            self.cached_input_trim_db = current_trim_db;
+            self.input_cal.set_user_trim_db(current_trim_db);
+            self.input_meter.set_input_scale(self.input_cal.input_scale());
+        }
+
+        // === TUBE TOGGLE → meter ceiling (once per buffer, change-detected) ===
+        let current_tube_toggle = self.params.tube_toggle.value();
+        if current_tube_toggle != self.cached_tube_toggle {
+            self.cached_tube_toggle = current_tube_toggle;
+            let v1_tube = if current_tube_toggle { &self.v1a_tube_mod } else { &self.v1a_tube_stock };
+            self.input_meter.set_clean_ceiling_v(meter_ceiling_for_tube(v1_tube, &self.jack_input));
+        }
 
         // === AmpTopology: begin buffer ===
         // Routes impedance feedback from previous buffer, prepares power supply interpolation
@@ -703,10 +789,11 @@ impl Plugin for TheTweed {
                 let tone = self.params.tone.smoothed.next();
                 let channel_mode = self.params.channel_select.value();
 
-                // === INPUT CALIBRATION ===
+                // === INPUT LEVEL METER (raw DAW signal, before calibration) ===
+                self.input_meter.process(input);
+
+                // === INPUT CALIBRATION (includes user trim via set_user_trim_db) ===
                 let mut signal = self.input_cal.process(input);
-                let input_trim = self.params.input_trim_db.smoothed.next();
-                signal *= neampmod_engine::db_to_linear(input_trim);
 
                 // === INPUT JACK VOLTAGE DIVIDER ===
                 signal = self.jack_input.process(signal);
@@ -724,17 +811,17 @@ impl Plugin for TheTweed {
 
                 // V1A (Normal) — uses B+3 (preamp rail, most filtered)
                 let v1a_out = if self.params.tube_toggle.value() {
-                    self.v1a_tube_12ax7.process(v1a_input, bias, b_plus_preamp)
+                    self.v1a_tube_mod.process(v1a_input, bias, b_plus_preamp)
                 } else {
-                    self.v1a_tube_12ay7.process(v1a_input, bias, b_plus_preamp)
+                    self.v1a_tube_stock.process(v1a_input, bias, b_plus_preamp)
                 };
                 let v1a_coupled = self.coupling_v1.process(v1a_out);
 
                 // V1B (Bright) — uses B+3 (preamp rail, most filtered)
                 let v1b_out = if self.params.tube_toggle.value() {
-                    self.v1b_tube_12ax7.process(v1b_input, bias, b_plus_preamp)
+                    self.v1b_tube_mod.process(v1b_input, bias, b_plus_preamp)
                 } else {
-                    self.v1b_tube_12ay7.process(v1b_input, bias, b_plus_preamp)
+                    self.v1b_tube_stock.process(v1b_input, bias, b_plus_preamp)
                 };
                 let v1b_coupled = self.coupling_v1b.process(v1b_out);
 
@@ -754,7 +841,7 @@ impl Plugin for TheTweed {
                 signal = self.filter_normal.process(v1a_coupled)
                        + self.filter_bright.process(v1b_coupled);
 
-                // === V2A Gain Stage (12AX7) — uses B+3 (preamp rail) ===
+                // === V2A Gain Stage — uses B+3 (preamp rail) ===
                 signal = self.v2a_tube.process(signal, preamp_bias_response.bias_voltage, b_plus_preamp);
                 signal = self.coupling_v2a.process(signal);
 
@@ -815,6 +902,10 @@ impl Plugin for TheTweed {
             }
         }
 
+        // === METER: snapshot metrics for GUI (once per buffer) ===
+        let metrics = self.input_meter.get_metrics();
+        self.meter_peak_volts.store(metrics.peak_volts, atomic::Ordering::Relaxed);
+
         ProcessStatus::Normal
     }
 
@@ -826,10 +917,11 @@ impl Plugin for TheTweed {
             let params = self.params.clone();
             let ir_status = self.ir_load_status.clone();
             let ir_path = self.params.ir_file_path.clone();
+            let meter_peak_volts = self.meter_peak_volts.clone();
 
             create_egui_editor(
                 EguiState::from_size(800, 450),
-                gui::GuiState::new(ir_status, ir_path),
+                gui::GuiState::new(ir_status, ir_path, meter_peak_volts),
                 |_, _| {},
                 move |egui_ctx, setter, state| {
                     gui::create(egui_ctx, setter, &params, state)

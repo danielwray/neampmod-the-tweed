@@ -124,13 +124,19 @@ pub fn default_state() {
 pub struct GuiState {
     pub ir_status: Arc<atomic::AtomicU8>,
     pub ir_path: Arc<Mutex<String>>,
+    pub meter_peak_volts: Arc<atomic_float::AtomicF32>,
 }
 
 impl GuiState {
-    pub fn new(ir_status: Arc<atomic::AtomicU8>, ir_path: Arc<Mutex<String>>) -> Self {
+    pub fn new(
+        ir_status: Arc<atomic::AtomicU8>,
+        ir_path: Arc<Mutex<String>>,
+        meter_peak_volts: Arc<atomic_float::AtomicF32>,
+    ) -> Self {
         Self {
             ir_status,
             ir_path,
+            meter_peak_volts,
         }
     }
 }
@@ -196,18 +202,49 @@ pub fn create(
                 }
             });
 
-            // Second row: Calibration controls
+            // Second row: Calibration controls + input level zone
             ui.horizontal(|ui| {
                 // Input calibration slider
                 ui.label("Input:");
                 let mut input_trim = params.input_trim_db.unmodulated_plain_value();
                 if ui.add(
-                    egui::Slider::new(&mut input_trim, -12.0..=12.0)
+                    egui::Slider::new(&mut input_trim, -18.0..=12.0)
                         .suffix(" dB")
                         .fixed_decimals(1)
                 ).changed() {
                     setter.set_parameter(&params.input_trim_db, input_trim);
                 }
+
+                // Input level indicator — shows physical voltage at V1a grid
+                // Color bands based on real-world guitar pickup output ranges
+                let peak_v = state.meter_peak_volts.load(atomic::Ordering::Relaxed);
+                let peak_mv = peak_v * 1000.0;
+                let zone_color = if peak_mv < 10.0 {
+                    egui::Color32::from_rgb(100, 100, 100)  // Gray: silent
+                } else if peak_mv <= 800.0 {
+                    egui::Color32::from_rgb(80, 180, 80)    // Green: typical guitar range
+                } else if peak_mv <= 1500.0 {
+                    egui::Color32::from_rgb(220, 200, 40)   // Yellow: hot / active pickup
+                } else {
+                    egui::Color32::from_rgb(200, 50, 50)    // Red: too hot
+                };
+
+                ui.label("Signal:");
+
+                // Colored zone rectangle
+                let (rect, _) = ui.allocate_exact_size(
+                    Vec2::new(8.0, 16.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(rect, 2.0, zone_color);
+
+                // Peak voltage — always show, default to 000 mV when silent
+                let voltage_text = if peak_v >= 1.0 {
+                    format!("{:.2} V", peak_v)
+                } else {
+                    format!("{:03.0} mV", peak_mv)
+                };
+                ui.colored_label(zone_color, voltage_text);
 
                 ui.separator();
 
@@ -215,7 +252,7 @@ pub fn create(
                 ui.label("Output:");
                 let mut output_trim = params.output_trim_db.unmodulated_plain_value();
                 if ui.add(
-                    egui::Slider::new(&mut output_trim, -24.0..=0.0)
+                    egui::Slider::new(&mut output_trim, -24.0..=-3.0)
                         .suffix(" dB")
                         .fixed_decimals(1)
                 ).changed() {

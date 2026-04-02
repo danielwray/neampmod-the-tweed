@@ -32,7 +32,36 @@ The plugin includes a `default.wav` IR file, I strongly suggest loading a higher
 the best out of the plugin; The following sources provide excellent impulse response files:
 
 * [Origin Effects IR Cab Library](https://origineffects.com/product/ir-cab-library/)
-* [Tone3000](https://tone3000.com/) # Search / Filter for IRs
+* [Tone3000](https://tone3000.com/)
+
+### Tone3000 IR Files
+
+I would suggest searching for Fender IRs on [Tone3000](https://tone3000.com/), there are a range of high-quality IRs with multiple microphones,
+and microphone positions.
+
+## Gain Setup
+
+The `Signal` level meter displays the signal voltage as the simulated amplifier's input jack would see it. 
+
+Use this to calibrate your signal chain to the physically correct operating range for the 1957 Fender® 5E3 Deluxe amplifier.
+
+Expected voltage ranges by pickup type:
+
+* Passive single-coils: 80 - 150mV moderate playing, 200–350mV hard attack
+* Passive humbuckers: 150 - 350mV moderate playing, 400–700mV hard attack
+* Active pickups: 500mV - 1.5V
+
+### Calibration workflow
+
+* Set your interface gain so hard playing peaks are comfortable and well below the clip LED — around -12 to -18 dBFS in your DAW if visible
+* Play normally across your full dynamic range
+* Use the input trim to bring the meter into the expected range for your pickup type
+  * If the signal sits consistently above the expected range, reduce trim — you are driving the first tube stage harder than the real circuit would be driven
+  * If it sits below, increase trim or add interface gain
+
+Where the signal lands on the meter determines where `V1A` operates on its transfer curve — too high and the amp
+will behave as if a boost pedal is already in the chain; too low and you will lose the touch sensitivity that emerges 
+near the operating point.
 
 ## Reporting Issues
 
