@@ -408,7 +408,7 @@ impl Default for TheTweed {
             amp_topology: AmpTopology::new(sample_rate, build_5e3_amp_topology_config()),
 
             // 5E3 volume pots: 1MΩ CTS 15A audio taper (both channels identical)
-            volume_taper: PotTaperConfig::new(PotTaper::Audio15A),
+            volume_taper: PotTaperConfig::new(PotTaper::Audio30A),
 
             speaker_normalizer: SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP),
 
