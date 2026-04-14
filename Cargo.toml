@@ -38,7 +38,8 @@ gui = ["nih_plug_egui", "rfd", "async-std"]
 lv2 = ["dep:lv2"]
 
 [profile.release]
-codegen-units = 3
+opt-level = 3
+codegen-units = 1
 lto = "fat"
 debug = false
 strip = true

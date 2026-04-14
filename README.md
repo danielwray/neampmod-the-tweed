@@ -36,8 +36,7 @@ the best out of the plugin; The following sources provide excellent impulse resp
 
 ### Tone3000 IR Files
 
-I would suggest searching for Fender IRs on [Tone3000](https://tone3000.com/), there are a range of high-quality IRs with multiple microphones,
-and microphone positions.
+I would suggest searching for Fender IRs on [Tone3000](https://tone3000.com/), there are a range of high-quality IRs with multiple microphones, and microphone positions.
 
 ## Gain Setup
 
