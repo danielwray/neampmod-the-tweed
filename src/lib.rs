@@ -12,6 +12,7 @@ use neampmod_engine::{
     // AmpTopology (replaces manual power section + power supply + speaker impedance)
     AmpTopology,
     AmpTopologyConfig,
+    ImpedanceConfig,
     // Bias modeling (preamp only — power tube bias handled by AmpTopology)
     CathodeBias,
     CathodeBiasConfig,
@@ -217,6 +218,11 @@ fn build_5e3_amp_topology_config() -> AmpTopologyConfig {
     config.power_section.power_tube_spec = Some(POWER_TUBE_SPEC.into());
     config.power_section.pi_spec = Some(PI_SPEC.into());
     config.power_supply.sag.rectifier_spec = Some(RECTIFIER_SPEC.into());
+    config.impedance = Some(ImpedanceConfig {
+        speaker_model: Some(SpeakerModel::JensenP),
+        cabinet_factor_override: Some(0.75),
+        ..Default::default()
+    });
     config
 }
 
