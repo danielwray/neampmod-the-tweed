@@ -13,9 +13,6 @@ use neampmod_engine::{
     AmpTopology,
     AmpTopologyConfig,
     ImpedanceConfig,
-    // Bias modeling (preamp only — power tube bias handled by AmpTopology)
-    CathodeBias,
-    CathodeBiasConfig,
     // Filters
     DCBlocker,
     NthOrderTdfii,
@@ -29,8 +26,13 @@ use neampmod_engine::{
     InputLevelMeter,
     // Coupling capacitors (preamp only — PI-to-power coupling handled by AmpTopology)
     CouplingCapacitor,
-    // Speaker normalizer (domain transition, plugin-side)
-    SpeakerNormalizer,
+    // Amp-referenced output normalizer (physical OT secondary volts → ±1 audio).
+    OutputNormalizer,
+    // TransformerRegistry: spec-driven OT construction (5E3 bobbin-wound early)
+    TransformerRegistry,
+    // SpeakerModel still needed for ImpedanceConfig in AmpTopology (impedance-curve
+    // selection lives on the electrical side of the power section, independent of
+    // the voltage normalization used for the IR path).
     SpeakerModel,
     // IR loader and convolver
     ir_loader,
@@ -192,7 +194,7 @@ impl Default for TheTweedParams {
             output_trim_db: FloatParam::new(
                 "Output Trim",
                 0.0,  // Additional trim on top of engine's 0db pro_audio_headroom()
-                FloatRange::Linear { min: -24.0, max: -3.0 },
+                FloatRange::Linear { min: -24.0, max: 0.0 },
             )
             .with_unit(" dB")
             .with_step_size(0.1)
@@ -213,10 +215,12 @@ impl Default for TheTweedParams {
 /// with current tracking enabled for authentic sag response.
 fn build_5e3_amp_topology_config() -> AmpTopologyConfig {
     let mut config = AmpTopologyConfig::fender_5e3();
-    // Enable current-based sag tracking for more responsive feel
-    config.power_supply.sag = config.power_supply.sag.with_current_tracking(80.0);
+    // Power-tube current is now auto-wired into the PSU per-sample by
+    // AmpTopology::process_power_section; the old with_current_tracking shim
+    // was removed with the Phase 1/2 voltage-domain PSU rewrite.
     config.power_section.power_tube_spec = Some(POWER_TUBE_SPEC.into());
     config.power_section.pi_spec = Some(PI_SPEC.into());
+    config.power_section.transformer_spec = Some(OT_SPEC.into());
     config.power_supply.sag.rectifier_spec = Some(RECTIFIER_SPEC.into());
     config.impedance = Some(ImpedanceConfig {
         speaker_model: Some(SpeakerModel::JensenP),
@@ -243,9 +247,6 @@ pub struct TheTweed {
     filter_normal: NthOrderTdfii,
     filter_bright: NthOrderTdfii,
     mixing_tone_controls: [f64; 3],  // cached for change detection
-
-    // Preamp bias modeling (power tube bias handled by AmpTopology)
-    preamp_bias: CathodeBias,
 
     // Preamp tube stages (Koren physics-based LUTs)
     // V1A (Normal channel) — two halves of the same tube
@@ -275,8 +276,10 @@ pub struct TheTweed {
     //   - All internal feedback loops (screen sag, cathode bias, sag→B+)
     amp_topology: AmpTopology,
 
-    // === Speaker Normalizer (physical secondary volts → normalized ±1 for IR) ===
-    speaker_normalizer: SpeakerNormalizer,
+    // === Output Normalizer (physical OT secondary volts → normalized ±1 for IR) ===
+    // Amp-referenced: divisor is derived from the 5E3's rail and OT turns ratio,
+    // not from the loaded speaker's rated power.
+    output_normalizer: OutputNormalizer,
 
     // === IR Convolution (block-based, matched to DAW buffer size) ===
     ir_convolver: ir_convolver::ZeroLatencyConvolver,
@@ -295,6 +298,12 @@ pub struct TheTweed {
 
     // Shared with GUI (written once per buffer from audio thread)
     meter_peak_volts: Arc<atomic_float::AtomicF32>,
+    // Circuit-stats modal: per-buffer physical-voltage snapshots
+    meter_bplus_volts: Arc<atomic_float::AtomicF32>,   // B+1 (power-tube tap) from PSU
+    meter_v1_volts: Arc<atomic_float::AtomicF32>,      // Active V1A plate-pin V, buffer mean
+    meter_v2_volts: Arc<atomic_float::AtomicF32>,      // V2A plate-pin V, buffer mean
+    meter_6v6_volts: Arc<atomic_float::AtomicF32>,     // 6V6 (pos tube) plate-pin V, buffer mean
+    meter_output_db: Arc<atomic_float::AtomicF32>,     // Post-master peak output, dB
 
     // IR loading state (shared with GUI)
     ir_load_status: Arc<atomic::AtomicU8>,  // 0=pending, 1=success, 2=failed
@@ -303,6 +312,10 @@ pub struct TheTweed {
 // -- Power Supply ---
 /// 5E3 preamp B+ voltage (B+3 tap after filter chain)
 const PREAMP_BPLUS_5E3: f32 = 250.0;
+/// 5E3 power-tube plate B+ (OT centre tap, B+1 tap; matches the nominal value
+/// in the engine's `AmpTopologyConfig::fender_5e3` preset). Used as the rail
+/// reference for `OutputNormalizer` — nominal value, not sag-modulated.
+const POWER_BPLUS_5E3: f32 = 350.0;
 
 // --- Tubes ---
 /// V1 stock tube — General Electric 12ay7
@@ -317,6 +330,8 @@ const PI_SPEC: &str = "ge_12ax7_cathodyne_56k";
 const POWER_TUBE_SPEC: &str = "rca_6v6gta_5e3";
 /// Rectifier — 5Y3
 const RECTIFIER_SPEC: &str = "5y3";
+/// Output transformer — early bobbin-wound 5E3 (TweedEraSilicon + BobbinWound)
+const OT_SPEC: &str = "fender_tweed_deluxe_5e3_early_bobbin";
 
 // --- 5E3 cathode circuit values ---
 /// V1 shared cathode resistor (Ω)
@@ -372,7 +387,11 @@ impl Default for TheTweed {
 
             input_cal,
             jack_input,
-            output_cal: OutputCalibration::pro_audio_headroom(),
+            // Output calibration trim — sized so that master=12, all-controls=12
+            // lands at approximately -3 dBFS peak given the 5E3's measured
+            // post-OutputNormalizer signal level and IR convolution gain. Keeps
+            // headroom for intersample peaks and downstream mastering.
+            output_cal: OutputCalibration::with_trim_db(-37.0),
 
             // Full MNA model of the 5E3 mixing + tone passive network.
             mna_normal: {
@@ -390,8 +409,6 @@ impl Default for TheTweed {
             filter_normal: NthOrderTdfii::new(2, sample_rate),
             filter_bright: NthOrderTdfii::new(2, sample_rate),
             mixing_tone_controls: [-1.0; 3],
-
-            preamp_bias: CathodeBias::new(CathodeBiasConfig::fender_5e3()),
 
             // V1A (Normal channel)
             v1a_tube_stock,
@@ -416,7 +433,12 @@ impl Default for TheTweed {
             // 5E3 volume pots: 1MΩ CTS 15A audio taper (both channels identical)
             volume_taper: PotTaperConfig::new(PotTaper::Audio30A),
 
-            speaker_normalizer: SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP),
+            output_normalizer: {
+                let ot_spec = TransformerRegistry::global()
+                    .lookup(OT_SPEC)
+                    .expect("OT_SPEC must be present in the engine registry");
+                OutputNormalizer::from_spec(ot_spec, POWER_BPLUS_5E3)
+            },
 
             // IR convolution - load and process embedded default.wav
             ir_convolver: {
@@ -449,6 +471,11 @@ impl Default for TheTweed {
 
             // Shared meter state (written by audio thread, read by GUI)
             meter_peak_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
+            meter_bplus_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
+            meter_v1_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
+            meter_v2_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
+            meter_6v6_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
+            meter_output_db: Arc::new(atomic_float::AtomicF32::new(-120.0)),
 
             // IR loading state (shared with GUI)
             ir_load_status: Arc::new(atomic::AtomicU8::new(1)),  // Start with success (embedded IR)
@@ -551,9 +578,6 @@ impl Plugin for TheTweed {
         self.filter_bright = NthOrderTdfii::new(2, self.sample_rate);
         self.mixing_tone_controls = [-1.0; 3];
 
-        // Initialize bias modeling
-        self.preamp_bias.initialize(self.sample_rate);
-
         // V1A (Normal)
         self.v1a_tube_stock = build_preamp_tube(self.sample_rate, V1_STOCK_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
         self.v1a_tube_mod = build_preamp_tube(self.sample_rate, V1_MOD_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
@@ -571,7 +595,12 @@ impl Plugin for TheTweed {
 
         // Reinitialize AmpTopology (PI → power tubes → OT → impedance + power supply)
         self.amp_topology = AmpTopology::new(self.sample_rate, build_5e3_amp_topology_config());
-        self.speaker_normalizer = SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP);
+        self.output_normalizer = {
+            let ot_spec = TransformerRegistry::global()
+                .lookup(OT_SPEC)
+                .expect("OT_SPEC must be present in the engine registry");
+            OutputNormalizer::from_spec(ot_spec, POWER_BPLUS_5E3)
+        };
 
         // Reload IR convolver with new sample rate and DAW buffer size
         // Check if a custom IR was persisted; if so, reload it from file
@@ -643,9 +672,6 @@ impl Plugin for TheTweed {
         self.filter_normal.reset();
         self.filter_bright.reset();
         self.mixing_tone_controls = [-1.0; 3];
-
-        // Reset preamp bias
-        self.preamp_bias.reset();
 
         // Reset preamp tube stages
         self.v1a_tube_stock.reset();
@@ -773,6 +799,13 @@ impl Plugin for TheTweed {
         // Routes impedance feedback from previous buffer, prepares power supply interpolation
         self.amp_topology.begin_buffer(num_samples);
 
+        // Circuit-stats accumulators — sampled per-sample inside the loop,
+        // averaged once at end-of-buffer for the GUI modal.
+        let mut v1_plate_sum = 0.0_f32;
+        let mut v2_plate_sum = 0.0_f32;
+        let mut v6v6_plate_sum = 0.0_f32;
+        let mut plate_samples_counted = 0u32;
+
         // === PASS 1: Per-sample signal chain ===
         for channel_samples in buffer.iter_samples() {
             for sample in channel_samples {
@@ -804,30 +837,28 @@ impl Plugin for TheTweed {
                 // === INPUT JACK VOLTAGE DIVIDER ===
                 signal = self.jack_input.process(signal);
 
-                // === B+ for preamp (from AmpTopology power supply) ===
+                // === B+ for preamp (from AmpTopology power supply, physical volts) ===
                 let b_plus_preamp = self.amp_topology.b_plus_for_stage("preamp");
 
-                let preamp_bias_response = self.preamp_bias.process(signal, 1.0);
-
                 // === DUAL-CHANNEL PREAMP (V1A Normal + V1B Bright) ===
+                // TubeStage::process now owns its cathode-bypass integrator — the
+                // former external CathodeBias shim was deleted in the Phase 3 rewrite.
                 let v1a_input = if channel_mode != ChannelMode::Bright { signal } else { 0.0 };
                 let v1b_input = if channel_mode != ChannelMode::Normal { signal } else { 0.0 };
 
-                let bias = preamp_bias_response.bias_voltage;
-
                 // V1A (Normal) — uses B+3 (preamp rail, most filtered)
                 let v1a_out = if self.params.tube_toggle.value() {
-                    self.v1a_tube_mod.process(v1a_input, bias, b_plus_preamp)
+                    self.v1a_tube_mod.process(v1a_input, b_plus_preamp).plate_ac_volts
                 } else {
-                    self.v1a_tube_stock.process(v1a_input, bias, b_plus_preamp)
+                    self.v1a_tube_stock.process(v1a_input, b_plus_preamp).plate_ac_volts
                 };
                 let v1a_coupled = self.coupling_v1.process(v1a_out);
 
                 // V1B (Bright) — uses B+3 (preamp rail, most filtered)
                 let v1b_out = if self.params.tube_toggle.value() {
-                    self.v1b_tube_mod.process(v1b_input, bias, b_plus_preamp)
+                    self.v1b_tube_mod.process(v1b_input, b_plus_preamp).plate_ac_volts
                 } else {
-                    self.v1b_tube_stock.process(v1b_input, bias, b_plus_preamp)
+                    self.v1b_tube_stock.process(v1b_input, b_plus_preamp).plate_ac_volts
                 };
                 let v1b_coupled = self.coupling_v1b.process(v1b_out);
 
@@ -848,8 +879,18 @@ impl Plugin for TheTweed {
                        + self.filter_bright.process(v1b_coupled);
 
                 // === V2A Gain Stage — uses B+3 (preamp rail) ===
-                signal = self.v2a_tube.process(signal, preamp_bias_response.bias_voltage, b_plus_preamp);
+                signal = self.v2a_tube.process(signal, b_plus_preamp).plate_ac_volts;
                 signal = self.coupling_v2a.process(signal);
+
+                // === CIRCUIT STATS: sample the active V1A half + V2A plate voltage ===
+                // (B+ and 6V6 plate are read after the power section call below.)
+                let v1a_active = if self.params.tube_toggle.value() {
+                    &self.v1a_tube_mod
+                } else {
+                    &self.v1a_tube_stock
+                };
+                v1_plate_sum += v1a_active.instantaneous_plate_volts();
+                v2_plate_sum += self.v2a_tube.instantaneous_plate_volts();
 
                 // === POWER SECTION (PI → power tubes → OT → speaker impedance) ===
                 // AmpTopology handles: cathodyne PI, PI-to-6V6 coupling, push-pull 6V6,
@@ -857,8 +898,16 @@ impl Plugin for TheTweed {
                 // power supply sag driving.
                 let ot_volts = self.amp_topology.process_power_section(signal);
 
+                // 6V6 plate voltage for the Circuit Stats modal (pos tube of the push-pull pair).
+                v6v6_plate_sum += self.amp_topology
+                    .last_diag()
+                    .power_section
+                    .power_tube_pos
+                    .plate_voltage_volts;
+                plate_samples_counted += 1;
+
                 // === NORMALIZE SPEAKER (physical OT secondary volts → ±1 for IR) ===
-                signal = self.speaker_normalizer.process(ot_volts);
+                signal = self.output_normalizer.process(ot_volts);
 
                 // Store pre-IR signal for block convolution
                 self.pre_ir_buffer[sample_idx] = signal;
@@ -881,6 +930,7 @@ impl Plugin for TheTweed {
         );
 
         // === PASS 3: Post-IR processing (output cal, master, DC block) ===
+        let mut output_peak = 0.0f32;
         {
             let output_channel = &mut buffer.as_slice()[0];
             for i in 0..num_samples {
@@ -904,6 +954,7 @@ impl Plugin for TheTweed {
                 // DC blocking and safety limiting
                 signal = self.dc_blocker_output.process(signal);
 
+                output_peak = output_peak.max(signal.abs());
                 output_channel[i] = signal;
             }
         }
@@ -911,6 +962,25 @@ impl Plugin for TheTweed {
         // === METER: snapshot metrics for GUI (once per buffer) ===
         let metrics = self.input_meter.get_metrics();
         self.meter_peak_volts.store(metrics.peak_volts, atomic::Ordering::Relaxed);
+
+        // === CIRCUIT STATS: B+ + buffer-mean plate voltages + output dB =========
+        if power_on {
+            let bplus_v = self.amp_topology.b_plus_for_stage("power_tube");
+            self.meter_bplus_volts.store(bplus_v, atomic::Ordering::Relaxed);
+
+            if plate_samples_counted > 0 {
+                let n = plate_samples_counted as f32;
+                self.meter_v1_volts.store(v1_plate_sum / n, atomic::Ordering::Relaxed);
+                self.meter_v2_volts.store(v2_plate_sum / n, atomic::Ordering::Relaxed);
+                self.meter_6v6_volts.store(v6v6_plate_sum / n, atomic::Ordering::Relaxed);
+            }
+        }
+        let output_db = if output_peak > 1e-10 {
+            20.0 * output_peak.log10()
+        } else {
+            -120.0
+        };
+        self.meter_output_db.store(output_db, atomic::Ordering::Relaxed);
 
         ProcessStatus::Normal
     }
@@ -924,10 +994,19 @@ impl Plugin for TheTweed {
             let ir_status = self.ir_load_status.clone();
             let ir_path = self.params.ir_file_path.clone();
             let meter_peak_volts = self.meter_peak_volts.clone();
+            let meter_bplus_volts = self.meter_bplus_volts.clone();
+            let meter_v1_volts = self.meter_v1_volts.clone();
+            let meter_v2_volts = self.meter_v2_volts.clone();
+            let meter_6v6_volts = self.meter_6v6_volts.clone();
+            let meter_output_db = self.meter_output_db.clone();
 
             create_egui_editor(
                 EguiState::from_size(800, 450),
-                gui::GuiState::new(ir_status, ir_path, meter_peak_volts),
+                gui::GuiState::new(
+                    ir_status, ir_path, meter_peak_volts,
+                    meter_bplus_volts, meter_v1_volts, meter_v2_volts,
+                    meter_6v6_volts, meter_output_db,
+                ),
                 |_, _| {},
                 move |egui_ctx, setter, state| {
                     gui::create(egui_ctx, setter, &params, state)
