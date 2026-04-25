@@ -1,12 +1,13 @@
 use nih_plug::prelude::*;
 use nih_plug_egui::egui::{self, Pos2, Rect, Vec2, ColorImage, TextureHandle};
 use std::sync::{Arc, Mutex, atomic};
+use std::sync::atomic::Ordering;
 
-use crate::{TheTweedParams, ChannelMode};
+use crate::{TheTweedParams, ChannelMode, IrLoadState, ir_load_status, load_ir_file_into_state};
 
 // Embedded image assets
-const BACKGROUND_ON: &[u8] = include_bytes!("../gui/background_on.png");
-const BACKGROUND_OFF: &[u8] = include_bytes!("../gui/background_off.png");
+const CONTROLS_IMAGE: &[u8] = include_bytes!("../gui/controls.png");
+const AMP_IMAGE: &[u8] = include_bytes!("../gui/amp.png");
 const SWITCH_ON: &[u8] = include_bytes!("../gui/toggle_on.png");
 const SWITCH_CENTER: &[u8] = include_bytes!("../gui/toggle_centered.png");
 const SWITCH_OFF: &[u8] = include_bytes!("../gui/toggle_off.png");
@@ -117,26 +118,45 @@ const KNOB_FRAMES: [&[u8]; 100] = [
     include_bytes!("../gui/0099.png"),
 ];
 
-pub fn default_state() {
-    // Default GUI state setup if needed
-}
-
 pub struct GuiState {
-    pub ir_status: Arc<atomic::AtomicU8>,
+    pub ir_load_state: Arc<IrLoadState>,
     pub ir_path: Arc<Mutex<String>>,
     pub meter_peak_volts: Arc<atomic_float::AtomicF32>,
+
+    // Circuit-stats snapshots (written per-buffer by the audio thread)
+    pub meter_bplus_volts: Arc<atomic_float::AtomicF32>,
+    pub meter_v1_volts: Arc<atomic_float::AtomicF32>,
+    pub meter_v2_volts: Arc<atomic_float::AtomicF32>,
+    pub meter_6v6_volts: Arc<atomic_float::AtomicF32>,
+    pub meter_output_db: Arc<atomic_float::AtomicF32>,
+
+    // Local GUI state (persists across frames but not sessions)
+    pub show_amp_view: bool,
+    pub show_circuit_stats: bool,
 }
 
 impl GuiState {
     pub fn new(
-        ir_status: Arc<atomic::AtomicU8>,
+        ir_load_state: Arc<IrLoadState>,
         ir_path: Arc<Mutex<String>>,
         meter_peak_volts: Arc<atomic_float::AtomicF32>,
+        meter_bplus_volts: Arc<atomic_float::AtomicF32>,
+        meter_v1_volts: Arc<atomic_float::AtomicF32>,
+        meter_v2_volts: Arc<atomic_float::AtomicF32>,
+        meter_6v6_volts: Arc<atomic_float::AtomicF32>,
+        meter_output_db: Arc<atomic_float::AtomicF32>,
     ) -> Self {
         Self {
-            ir_status,
+            ir_load_state,
             ir_path,
             meter_peak_volts,
+            meter_bplus_volts,
+            meter_v1_volts,
+            meter_v2_volts,
+            meter_6v6_volts,
+            meter_output_db,
+            show_amp_view: false,
+            show_circuit_stats: false,
         }
     }
 }
@@ -154,9 +174,14 @@ pub fn create(
             ui.horizontal(|ui| {
                 ui.label("IR Cabinet:");
 
-                // Browse button to open file dialog
+                // Browse button to open file dialog. The worker thread does
+                // the whole load-and-build pipeline (WAV parse → rubato
+                // resample → normalise → FFT plan) and publishes the finished
+                // convolver to `ir_load_state.pending`. The audio thread picks
+                // it up and crossfades in — see `load_ir_file_into_state` and
+                // `HotSwapConvolver::queue_swap`.
                 if ui.button("Browse...").clicked() {
-                    let ir_status = state.ir_status.clone();
+                    let ir_load_state = state.ir_load_state.clone();
                     let ir_path = state.ir_path.clone();
 
                     // Spawn file dialog using async-std runtime
@@ -168,10 +193,20 @@ pub fn create(
                                 .set_title("Select Impulse Response");
 
                             if let Some(file_handle) = dialog.pick_file().await {
-                                if let Ok(mut path_lock) = ir_path.lock() {
-                                    *path_lock = file_handle.path().display().to_string();
+                                let path = file_handle.path().to_path_buf();
+                                load_ir_file_into_state(&ir_load_state, &path);
+                                // Persist the path ONLY on successful load so
+                                // the DAW session stores a working reference.
+                                // Failed loads leave the prior persisted path
+                                // alone — user can see the failed file in UI
+                                // but it won't be auto-reloaded on restart.
+                                if ir_load_state.status.load(Ordering::Relaxed)
+                                    == ir_load_status::LOADED
+                                {
+                                    if let Ok(mut path_lock) = ir_path.lock() {
+                                        *path_lock = path.display().to_string();
+                                    }
                                 }
-                                ir_status.store(0, atomic::Ordering::Relaxed); // Pending
                             }
                         });
                     });
@@ -179,13 +214,14 @@ pub fn create(
 
                 ui.separator();
 
-                // Status indicator
-                let status = state.ir_status.load(atomic::Ordering::Relaxed);
+                // Status indicator — derived from IrLoadState.
+                let status = state.ir_load_state.status.load(Ordering::Relaxed);
                 let (color, text) = match status {
-                    0 => (egui::Color32::GRAY, "Loading..."),
-                    1 => (egui::Color32::GREEN, "Loaded"),
-                    2 => (egui::Color32::RED, "Failed"),
-                    _ => (egui::Color32::GRAY, "No IR"),
+                    ir_load_status::LOADING => (egui::Color32::GRAY, "Loading..."),
+                    ir_load_status::LOADED => (egui::Color32::GREEN, "Loaded"),
+                    ir_load_status::FAILED => (egui::Color32::RED, "Failed"),
+                    // NO_IR (default) — unity passthrough active.
+                    _ => (egui::Color32::GRAY, "No IR Loaded"),
                 };
 
                 ui.colored_label(color, text);
@@ -199,6 +235,18 @@ pub fn create(
                             .unwrap_or("unknown");
                         ui.label(format!("({})", filename));
                     }
+                }
+
+                ui.separator();
+
+                // View toggle: controls panel vs. amp cabinet photo
+                if ui.button("View").clicked() {
+                    state.show_amp_view = !state.show_amp_view;
+                }
+
+                // Circuit stats modal
+                if ui.button("Circuit Stats").clicked() {
+                    state.show_circuit_stats = !state.show_circuit_stats;
                 }
             });
 
@@ -252,7 +300,7 @@ pub fn create(
                 ui.label("Output:");
                 let mut output_trim = params.output_trim_db.unmodulated_plain_value();
                 if ui.add(
-                    egui::Slider::new(&mut output_trim, -24.0..=-3.0)
+                    egui::Slider::new(&mut output_trim, -24.0..=0.0)
                         .suffix(" dB")
                         .fixed_decimals(1)
                 ).changed() {
@@ -268,15 +316,18 @@ pub fn create(
             // Set window size to match concept image proportions
             ui.set_min_size(Vec2::new(800.0, 400.0));
 
-            // Choose background based on power state
-            let background_bytes = if params.power.value() {
-                BACKGROUND_ON
-            } else {
-                BACKGROUND_OFF
-            };
+            if state.show_amp_view {
+                // === AMP CABINET PHOTO VIEW ===
+                let amp_texture = load_texture_from_bytes(egui_ctx, "amp_view", AMP_IMAGE);
+                let amp_image = egui::Image::from_texture(&amp_texture)
+                    .fit_to_exact_size(Vec2::new(800.0, 400.0));
+                ui.add_sized([800.0, 400.0], amp_image);
+                return;
+            }
 
-            // Load and display background image at exact size
-            let background_texture = load_texture_from_bytes(egui_ctx, "background", background_bytes);
+            // === CONTROLS VIEW (default) ===
+            // Single background image regardless of power state.
+            let background_texture = load_texture_from_bytes(egui_ctx, "controls", CONTROLS_IMAGE);
             let background_image = egui::Image::from_texture(&background_texture)
                 .fit_to_exact_size(Vec2::new(800.0, 400.0));
 
@@ -380,6 +431,91 @@ pub fn create(
                 }
             );
         });
+
+    // === CIRCUIT STATS MODAL ===
+    if state.show_circuit_stats {
+        let screen_rect = egui_ctx.screen_rect();
+        let modal_size = Vec2::new(240.0, 246.0);
+        let modal_rect = Rect::from_center_size(screen_rect.center(), modal_size);
+
+        egui::Area::new(egui::Id::new("stats_overlay"))
+            .fixed_pos(Pos2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(egui_ctx, |ui| {
+                let (rect, response) = ui.allocate_exact_size(screen_rect.size(), egui::Sense::click());
+
+                // Dark overlay
+                ui.painter().rect_filled(
+                    rect, 0.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                );
+
+                // Modal frame
+                ui.painter().rect_filled(
+                    modal_rect, 8.0,
+                    egui::Color32::from_rgb(30, 30, 30),
+                );
+                ui.painter().rect_stroke(
+                    modal_rect, 8.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80)),
+                    egui::StrokeKind::Outside,
+                );
+
+                // Read per-buffer circuit stats from audio thread
+                let input_mv = state.meter_peak_volts.load(atomic::Ordering::Relaxed) * 1000.0;
+                let bplus_v = state.meter_bplus_volts.load(atomic::Ordering::Relaxed);
+                let v1_v = state.meter_v1_volts.load(atomic::Ordering::Relaxed);
+                let v2_v = state.meter_v2_volts.load(atomic::Ordering::Relaxed);
+                let v6v6_v = state.meter_6v6_volts.load(atomic::Ordering::Relaxed);
+                let output_db = state.meter_output_db.load(atomic::Ordering::Relaxed);
+
+                let text_color = egui::Color32::from_rgb(220, 220, 220);
+                let label_color = egui::Color32::from_rgb(150, 150, 150);
+
+                // Title
+                ui.painter().text(
+                    Pos2::new(modal_rect.center().x, modal_rect.min.y + 25.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Circuit Stats",
+                    egui::FontId::proportional(16.0),
+                    text_color,
+                );
+
+                // Signal flow: B+ rail → Input → V1 → V2A → 6V6 → Output
+                let left_x = modal_rect.min.x + 30.0;
+                let right_x = modal_rect.max.x - 30.0;
+                let mut y = modal_rect.min.y + 55.0;
+                let line_h = 26.0;
+
+                for (label, value) in [
+                    ("B+:", format!("{:.0}v", bplus_v)),
+                    ("Input:", format!("{:.0}mV", input_mv)),
+                    ("V1:", format!("{:.0}v", v1_v)),
+                    ("V2:", format!("{:.0}v", v2_v)),
+                    ("V3/4:", format!("{:.0}v", v6v6_v)),
+                    ("Output:", format!("{:.0}dB", output_db)),
+                ] {
+                    ui.painter().text(
+                        Pos2::new(left_x, y), egui::Align2::LEFT_CENTER,
+                        label, egui::FontId::proportional(14.0), label_color,
+                    );
+                    ui.painter().text(
+                        Pos2::new(right_x, y), egui::Align2::RIGHT_CENTER,
+                        &value, egui::FontId::proportional(14.0), text_color,
+                    );
+                    y += line_h;
+                }
+
+                // Click outside modal to close
+                if response.clicked() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        if !modal_rect.contains(pos) {
+                            state.show_circuit_stats = false;
+                        }
+                    }
+                }
+            });
+    }
 }
 
 // Helper function to load texture from PNG bytes

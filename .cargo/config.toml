@@ -1,0 +1,3 @@
+# CI related things... Only the follow MLUT files will be included from the engine.
+[env]
+NEAMPMOD_TUBES = "ge_12ay7_100k,rca_12ax7a_100k,ge_12ax7_cathodyne_56k,rca_6v6gta_5e3,5y3"
