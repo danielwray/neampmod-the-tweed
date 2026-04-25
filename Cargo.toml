@@ -1,7 +1,7 @@
 [package]
 name = "the-tweed"
 version = "1.0.0" # default to 1.0.0 as will be replaced in pipeline when building release
-edition = "2021"
+edition = "2024"
 authors = ["NEAMPMOD <daniel.wray.uk+neampmod@gmail.com>"]
 description = "Vintage tweed amplifier simulator inspired by classic 1950s circuits"
 license = "GPL-3.0-or-later"
@@ -15,12 +15,15 @@ name = "the-tweed"
 path = "src/main.rs"
 required-features = []
 
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
 [dependencies]
 # NEAMPMOD DSP Engine - provides all tube modeling, filters, IR convolution
 neampmod-engine = { path = "../neampmod-engine" }
 
 # Audio plugin framework - with LV2 support
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = [] }
 lv2 = { version = "0.6", optional = true }
 
 # GUI framework - optional for builds without X11
@@ -43,7 +46,7 @@ codegen-units = 1
 lto = "fat"
 debug = false
 strip = true
-panic = "unwind"
+panic = "abort"
 
 [profile.profiling]
 inherits = "release"

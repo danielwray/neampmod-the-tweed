@@ -1,5 +1,6 @@
 use nih_plug::prelude::*;
 use std::sync::{Arc, Mutex, atomic};
+use std::sync::atomic::Ordering;
 
 #[cfg(feature = "gui")]
 mod gui;
@@ -12,6 +13,7 @@ use neampmod_engine::{
     // AmpTopology (replaces manual power section + power supply + speaker impedance)
     AmpTopology,
     AmpTopologyConfig,
+    BPlusTap,
     ImpedanceConfig,
     // Filters
     DCBlocker,
@@ -44,9 +46,65 @@ use neampmod_engine::{
     JackInput,
 };
 
-// Embedded IR from assets/ir/default.wav (compiled into binary)
-// TODO: Replace this with a hihger quality generated IR file
-const CABINET_IR_BYTES: &[u8] = include_bytes!("../assets/ir/default.wav");
+const IR_CROSSFADE_MS: f32 = 30.0;
+
+pub struct IrLoadState {
+    pub pending: Mutex<Option<ir_convolver::ZeroLatencyConvolver>>,
+    pub sample_rate: atomic_float::AtomicF32,
+    pub block_size: atomic::AtomicUsize,
+    pub status: atomic::AtomicU8,
+}
+
+pub mod ir_load_status {
+    pub const LOADING: u8 = 0;
+    pub const LOADED: u8 = 1;
+    pub const FAILED: u8 = 2;
+    pub const NO_IR: u8 = 3;
+}
+
+impl IrLoadState {
+    pub fn new() -> Self {
+        Self {
+            pending: Mutex::new(None),
+            sample_rate: atomic_float::AtomicF32::new(48_000.0),
+            block_size: atomic::AtomicUsize::new(512),
+            status: atomic::AtomicU8::new(ir_load_status::NO_IR),
+        }
+    }
+
+    pub fn set_audio_format(&self, sample_rate: f32, block_size: usize) {
+        self.sample_rate.store(sample_rate, Ordering::Relaxed);
+        self.block_size.store(block_size, Ordering::Relaxed);
+    }
+}
+
+impl Default for IrLoadState {
+    fn default() -> Self { Self::new() }
+}
+
+pub fn load_ir_file_into_state(state: &IrLoadState, path: &std::path::Path) {
+    state.status.store(ir_load_status::LOADING, Ordering::Relaxed);
+
+    let sample_rate = state.sample_rate.load(Ordering::Relaxed);
+    let block_size = state.block_size.load(Ordering::Relaxed);
+
+    let loader = ir_loader::IrLoader::new(sample_rate);
+    match loader.load_from_file(path) {
+        Ok((mut ir, _, _)) => {
+            ir_loader::IrLoader::remove_dc_offset(&mut ir);
+            ir_loader::IrLoader::normalize_rms(&mut ir, -12.0);
+            let fir_len = 128.min(block_size);
+            let conv = ir_convolver::ZeroLatencyConvolver::new(&ir, block_size, fir_len);
+            if let Ok(mut pending) = state.pending.lock() {
+                *pending = Some(conv);
+            }
+            state.status.store(ir_load_status::LOADED, Ordering::Relaxed);
+        }
+        Err(_) => {
+            state.status.store(ir_load_status::FAILED, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Maps internal 0.0–1.0 parameter value to 5E3 faceplate numbering (1–12).
 fn v2s_dial_1_to_12() -> Arc<dyn Fn(f32) -> String + Send + Sync> {
@@ -202,8 +260,9 @@ impl Default for TheTweedParams {
             .with_value_to_string(formatters::v2s_f32_rounded(1))
             .with_string_to_value(Arc::new(|s: &str| s.trim().parse().ok())),
 
-            // IR file path - persisted with DAW session
-            ir_file_path: Arc::new(Mutex::new("default.wav".to_string())),
+            // IR file path - persisted with DAW session. Empty string means
+            // "no IR loaded" — the signal path runs as a unity passthrough.
+            ir_file_path: Arc::new(Mutex::new(String::new())),
         }
     }
 }
@@ -275,17 +334,25 @@ pub struct TheTweed {
     //   - Power supply (5Y3 sag + ripple + 3-tap B+ topology)
     //   - All internal feedback loops (screen sag, cathode bias, sag→B+)
     amp_topology: AmpTopology,
+    // B+ tap handles, resolved once per AmpTopology lifetime to avoid per-sample
+    // string lookups. Refreshed in `initialize()` after `AmpTopology::new`.
+    preamp_tap: BPlusTap,
+    power_tube_tap: BPlusTap,
 
     // === Output Normalizer (physical OT secondary volts → normalized ±1 for IR) ===
     // Amp-referenced: divisor is derived from the 5E3's rail and OT turns ratio,
     // not from the loaded speaker's rated power.
     output_normalizer: OutputNormalizer,
 
-    // === IR Convolution (block-based, matched to DAW buffer size) ===
-    ir_convolver: ir_convolver::ZeroLatencyConvolver,
+    // === IR Convolution ===
+    ir_convolver: ir_convolver::HotSwapConvolver,
+    ir_load_state: Arc<IrLoadState>,
     pre_ir_buffer: Vec<f32>,
     post_ir_buffer: Vec<f32>,
     ir_block_size: usize,
+    /// Crossfade length in samples, recomputed at `initialize()` time from
+    /// `IR_CROSSFADE_MS * sample_rate`. Passed to `HotSwapConvolver::queue_swap`.
+    ir_crossfade_samples: usize,
 
     // Volume pot taper (1MΩ 15A audio taper, same for both channels)
     volume_taper: PotTaperConfig,
@@ -305,8 +372,6 @@ pub struct TheTweed {
     meter_6v6_volts: Arc<atomic_float::AtomicF32>,     // 6V6 (pos tube) plate-pin V, buffer mean
     meter_output_db: Arc<atomic_float::AtomicF32>,     // Post-master peak output, dB
 
-    // IR loading state (shared with GUI)
-    ir_load_status: Arc<atomic::AtomicU8>,  // 0=pending, 1=success, 2=failed
 }
 
 // -- Power Supply ---
@@ -381,6 +446,12 @@ impl Default for TheTweed {
         let meter_ceiling = meter_ceiling_for_tube(&v1a_tube_stock, &jack_input);
         let input_meter = InputLevelMeter::new(sample_rate, input_cal.input_scale(), meter_ceiling);
 
+        // Resolve B+ tap handles once at construction — avoids per-sample string
+        // lookups in process(). Refreshed in initialize() when topology rebuilds.
+        let amp_topology = AmpTopology::new(sample_rate, build_5e3_amp_topology_config());
+        let preamp_tap = amp_topology.b_plus_tap("preamp");
+        let power_tube_tap = amp_topology.b_plus_tap("power_tube");
+
         Self {
             params: Arc::new(TheTweedParams::default()),
             sample_rate,
@@ -428,7 +499,9 @@ impl Default for TheTweed {
             // AmpTopology: PI → power tubes → OT → speaker impedance + power supply
             // This uses the 5e3 preset in the engine (it is configurable so any topology, within
             // reason can be passed in).. Smooth. Nice.
-            amp_topology: AmpTopology::new(sample_rate, build_5e3_amp_topology_config()),
+            amp_topology,
+            preamp_tap,
+            power_tube_tap,
 
             // 5E3 volume pots: 1MΩ CTS 15A audio taper (both channels identical)
             volume_taper: PotTaperConfig::new(PotTaper::Audio30A),
@@ -440,27 +513,12 @@ impl Default for TheTweed {
                 OutputNormalizer::from_spec(ot_spec, POWER_BPLUS_5E3)
             },
 
-            // IR convolution - load and process embedded default.wav
-            ir_convolver: {
-                let ir_loader = ir_loader::IrLoader::new(sample_rate);
-                match ir_loader.load_from_bytes(CABINET_IR_BYTES) {
-                    Ok((ir, _, _)) => {
-                        let mut processed_ir = ir;
-                        // Remove DC offset and normalize
-                        ir_loader::IrLoader::remove_dc_offset(&mut processed_ir);
-                        ir_loader::IrLoader::normalize_rms(&mut processed_ir, -12.0);
-                        // Zero-latency convolver: block_size=512, FIR=128
-                        ir_convolver::ZeroLatencyConvolver::new(&processed_ir, 512, 128)
-                    }
-                    Err(_) => {
-                        // Fallback: unity impulse (bypass)
-                        ir_convolver::ZeroLatencyConvolver::new(&[1.0], 512, 1)
-                    }
-                }
-            },
+            ir_convolver: ir_convolver::HotSwapConvolver::new(&[1.0], 512, 1),
+            ir_load_state: Arc::new(IrLoadState::new()),
             pre_ir_buffer: vec![0.0; 512],
             post_ir_buffer: vec![0.0; 512],
             ir_block_size: 512,
+            ir_crossfade_samples: (IR_CROSSFADE_MS * 48.0) as usize, // 1440 samples at 48k
 
             dc_blocker_output: DCBlocker::new(sample_rate, 10.0),
 
@@ -476,42 +534,16 @@ impl Default for TheTweed {
             meter_v2_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
             meter_6v6_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
             meter_output_db: Arc::new(atomic_float::AtomicF32::new(-120.0)),
-
-            // IR loading state (shared with GUI)
-            ir_load_status: Arc::new(atomic::AtomicU8::new(1)),  // Start with success (embedded IR)
         }
     }
 }
 
 impl TheTweed {
-    /// Load IR from file path
-    /// Returns true if successful
-    pub fn load_ir_from_file(&mut self, path: &std::path::Path) -> bool {
-        use neampmod_engine::{ir_loader::IrLoader, ir_convolver::ZeroLatencyConvolver};
-
-        let ir_loader = IrLoader::new(self.sample_rate);
-
-        match ir_loader.load_from_file(path) {
-            Ok((mut ir, _, _)) => {
-                // Process IR: remove DC and normalize
-                IrLoader::remove_dc_offset(&mut ir);
-                IrLoader::normalize_rms(&mut ir, -12.0);
-
-                // Create new convolver matched to DAW buffer size
-                let fir_len = 128.min(self.ir_block_size);
-                self.ir_convolver = ZeroLatencyConvolver::new(&ir, self.ir_block_size, fir_len);
-
-                // Update status
-                self.ir_load_status.store(1, atomic::Ordering::Relaxed);
-                if let Ok(mut path_str) = self.params.ir_file_path.lock() {
-                    *path_str = path.display().to_string();
-                }
-
-                true
-            }
-            Err(_) => {
-                self.ir_load_status.store(2, atomic::Ordering::Relaxed);
-                false
+    pub fn load_ir_from_file(&self, path: &std::path::Path) {
+        load_ir_file_into_state(&self.ir_load_state, path);
+        if self.ir_load_state.status.load(Ordering::Relaxed) == ir_load_status::LOADED {
+            if let Ok(mut p) = self.params.ir_file_path.lock() {
+                *p = path.display().to_string();
             }
         }
     }
@@ -595,6 +627,9 @@ impl Plugin for TheTweed {
 
         // Reinitialize AmpTopology (PI → power tubes → OT → impedance + power supply)
         self.amp_topology = AmpTopology::new(self.sample_rate, build_5e3_amp_topology_config());
+        // Re-resolve B+ tap handles against the fresh topology's power supply.
+        self.preamp_tap = self.amp_topology.b_plus_tap("preamp");
+        self.power_tube_tap = self.amp_topology.b_plus_tap("power_tube");
         self.output_normalizer = {
             let ot_spec = TransformerRegistry::global()
                 .lookup(OT_SPEC)
@@ -602,40 +637,25 @@ impl Plugin for TheTweed {
             OutputNormalizer::from_spec(ot_spec, POWER_BPLUS_5E3)
         };
 
-        // Reload IR convolver with new sample rate and DAW buffer size
-        // Check if a custom IR was persisted; if so, reload it from file
+        // === IR CONVOLVER REBUILD ===
+        self.ir_convolver = ir_convolver::HotSwapConvolver::new(&[1.0], self.ir_block_size, 1);
+        self.ir_crossfade_samples = (IR_CROSSFADE_MS * self.sample_rate / 1000.0) as usize;
+        self.ir_load_state.set_audio_format(self.sample_rate, self.ir_block_size);
+        self.ir_load_state.status.store(ir_load_status::NO_IR, Ordering::Relaxed);
+        // Clear any stale pending convolver left over from a prior lifecycle.
+        if let Ok(mut p) = self.ir_load_state.pending.lock() {
+            *p = None;
+        }
+
         let persisted_ir_path = self.params.ir_file_path.lock()
             .map(|p| p.clone())
-            .unwrap_or_else(|_| "default.wav".to_string());
-
-        let ir_reloaded = if persisted_ir_path != "default.wav" {
-            // Try to reload the custom IR from its original file path
+            .unwrap_or_default();
+        if !persisted_ir_path.is_empty() {
             let path = std::path::PathBuf::from(&persisted_ir_path);
             if path.exists() {
-                self.load_ir_from_file(&path)
+                load_ir_file_into_state(&self.ir_load_state, &path);
             } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        if !ir_reloaded {
-            // Fall back to embedded default IR
-            let ir_loader = ir_loader::IrLoader::new(self.sample_rate);
-            if let Ok((ir, _, _)) = ir_loader.load_from_bytes(CABINET_IR_BYTES) {
-                let mut processed_ir = ir;
-                ir_loader::IrLoader::remove_dc_offset(&mut processed_ir);
-                ir_loader::IrLoader::normalize_rms(&mut processed_ir, -12.0);
-                let fir_len = 128.min(self.ir_block_size);
-                self.ir_convolver = ir_convolver::ZeroLatencyConvolver::new(&processed_ir, self.ir_block_size, fir_len);
-            }
-            // Reset path to default if custom failed to load
-            if persisted_ir_path != "default.wav" {
-                if let Ok(mut p) = self.params.ir_file_path.lock() {
-                    *p = "default.wav".to_string();
-                }
-                self.ir_load_status.store(2, atomic::Ordering::Relaxed);
+                self.ir_load_state.status.store(ir_load_status::FAILED, Ordering::Relaxed);
             }
         }
 
@@ -704,14 +724,9 @@ impl Plugin for TheTweed {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        // Check for pending IR load (once per buffer)
-        if self.ir_load_status.load(atomic::Ordering::Relaxed) == 0 {
-            let path_opt = self.params.ir_file_path.try_lock()
-                .ok()
-                .map(|guard| std::path::PathBuf::from(guard.as_str()));
-
-            if let Some(path) = path_opt {
-                self.load_ir_from_file(&path);
+        if let Ok(mut pending) = self.ir_load_state.pending.try_lock() {
+            if let Some(new_conv) = pending.take() {
+                self.ir_convolver.queue_swap(new_conv, self.ir_crossfade_samples);
             }
         }
 
@@ -720,12 +735,6 @@ impl Plugin for TheTweed {
         // serve as grid leak through their wiper-to-ground DC resistance.
         // Coupling caps block DC, so only the wiper-to-ground path counts.
         // DC path per channel: 68kΩ mixing R + wiper_frac × 1MΩ pot
-        //
-        //TODO: Volume interactions is incorrect, from testing it feels like the
-        //      volume interaction is backwards, also tone control feels like it's
-        //      subtracting/ adding too much gain
-        //- Unused vol DOWN -> grid leak drops -> more dirt
-        //- Unused vol UP   -> grid leak rises -> cleans up the channel in use
         {
             let bright_wiper_dc = self.volume_taper.wiper_fraction(self.params.bright_volume.value());
             let normal_wiper_dc = self.volume_taper.wiper_fraction(self.params.normal_volume.value());
@@ -768,7 +777,6 @@ impl Plugin for TheTweed {
         }
 
         // Propagate input jack series resistance to V1 grid current models.
-        // Z_source is currently fixed (no guitar volume param), so set once per buffer.
         let grid_series_r = self.jack_input.source_series_resistance();
         self.v1a_tube_stock.set_grid_series_resistance(grid_series_r);
         self.v1a_tube_mod.set_grid_series_resistance(grid_series_r);
@@ -779,7 +787,7 @@ impl Plugin for TheTweed {
         let power_on = self.params.power.value();
         let mut sample_idx = 0usize;
 
-        // === INPUT TRIM → InputCalibration (once per buffer, change-detected) ===
+        // === INPUT TRIM → InputCalibration ===
         let current_trim_db = self.params.input_trim_db.value();
         if (current_trim_db - self.cached_input_trim_db).abs() > 0.01 {
             self.cached_input_trim_db = current_trim_db;
@@ -787,12 +795,31 @@ impl Plugin for TheTweed {
             self.input_meter.set_input_scale(self.input_cal.input_scale());
         }
 
-        // === TUBE TOGGLE → meter ceiling (once per buffer, change-detected) ===
+        // === TUBE TOGGLE → meter ceiling ===
         let current_tube_toggle = self.params.tube_toggle.value();
         if current_tube_toggle != self.cached_tube_toggle {
             self.cached_tube_toggle = current_tube_toggle;
             let v1_tube = if current_tube_toggle { &self.v1a_tube_mod } else { &self.v1a_tube_stock };
             self.input_meter.set_clean_ceiling_v(meter_ceiling_for_tube(v1_tube, &self.jack_input));
+        }
+
+        // === MNA MIXING + TONE NETWORK ===
+        {
+            let normal_wiper = self.volume_taper.wiper_fraction(self.params.normal_volume.value()) as f64;
+            let bright_wiper = self.volume_taper.wiper_fraction(self.params.bright_volume.value()) as f64;
+            let tone_raw = self.params.tone.value() as f64;
+            let controls = [normal_wiper, bright_wiper, tone_raw];
+            let controls_changed = controls.iter().zip(self.mixing_tone_controls.iter())
+                .any(|(a, b)| (a - b).abs() > 0.001);
+            if controls_changed {
+                self.mixing_tone_controls = controls;
+                if let Ok(coeffs) = self.mna_normal.compute_coefficients(&controls) {
+                    self.filter_normal.set_analog_coefficients(&coeffs, self.sample_rate);
+                }
+                if let Ok(coeffs) = self.mna_bright.compute_coefficients(&controls) {
+                    self.filter_bright.set_analog_coefficients(&coeffs, self.sample_rate);
+                }
+            }
         }
 
         // === AmpTopology: begin buffer ===
@@ -820,12 +847,10 @@ impl Plugin for TheTweed {
                 // Advance power supply interpolation
                 self.amp_topology.advance_sample();
 
-                // === Get smoothed parameters ===
-                let bright_vol_raw = self.params.bright_volume.smoothed.next();
-                let normal_vol_raw = self.params.normal_volume.smoothed.next();
-                let bright_wiper = self.volume_taper.wiper_fraction(bright_vol_raw);
-                let normal_wiper = self.volume_taper.wiper_fraction(normal_vol_raw);
-                let tone = self.params.tone.smoothed.next();
+                // === Get control-rate parameters ===
+                // normal_volume / bright_volume / tone are handled once-per-buffer
+                // above (MNA mixing + tone network). channel_select is an enum
+                // param, no smoothing.
                 let channel_mode = self.params.channel_select.value();
 
                 // === INPUT LEVEL METER (raw DAW signal, before calibration) ===
@@ -838,7 +863,7 @@ impl Plugin for TheTweed {
                 signal = self.jack_input.process(signal);
 
                 // === B+ for preamp (from AmpTopology power supply, physical volts) ===
-                let b_plus_preamp = self.amp_topology.b_plus_for_stage("preamp");
+                let b_plus_preamp = self.amp_topology.b_plus_at(self.preamp_tap);
 
                 // === DUAL-CHANNEL PREAMP (V1A Normal + V1B Bright) ===
                 // TubeStage::process now owns its cathode-bypass integrator — the
@@ -862,19 +887,7 @@ impl Plugin for TheTweed {
                 };
                 let v1b_coupled = self.coupling_v1b.process(v1b_out);
 
-                // === MNA MIXING + TONE NETWORK ===
-                let controls = [normal_wiper as f64, bright_wiper as f64, tone as f64];
-                let controls_changed = controls.iter().zip(self.mixing_tone_controls.iter())
-                    .any(|(a, b)| (a - b).abs() > 0.001);
-                if controls_changed {
-                    self.mixing_tone_controls = controls;
-                    if let Ok(coeffs) = self.mna_normal.compute_coefficients(&controls) {
-                        self.filter_normal.set_analog_coefficients(&coeffs, self.sample_rate);
-                    }
-                    if let Ok(coeffs) = self.mna_bright.compute_coefficients(&controls) {
-                        self.filter_bright.set_analog_coefficients(&coeffs, self.sample_rate);
-                    }
-                }
+                // === MNA MIXING + TONE NETWORK (filter only; rebuild is per-buffer above) ===
                 signal = self.filter_normal.process(v1a_coupled)
                        + self.filter_bright.process(v1b_coupled);
 
@@ -965,7 +978,7 @@ impl Plugin for TheTweed {
 
         // === CIRCUIT STATS: B+ + buffer-mean plate voltages + output dB =========
         if power_on {
-            let bplus_v = self.amp_topology.b_plus_for_stage("power_tube");
+            let bplus_v = self.amp_topology.b_plus_at(self.power_tube_tap);
             self.meter_bplus_volts.store(bplus_v, atomic::Ordering::Relaxed);
 
             if plate_samples_counted > 0 {
@@ -991,7 +1004,7 @@ impl Plugin for TheTweed {
             use nih_plug_egui::{create_egui_editor, EguiState};
 
             let params = self.params.clone();
-            let ir_status = self.ir_load_status.clone();
+            let ir_load_state = self.ir_load_state.clone();
             let ir_path = self.params.ir_file_path.clone();
             let meter_peak_volts = self.meter_peak_volts.clone();
             let meter_bplus_volts = self.meter_bplus_volts.clone();
@@ -1003,7 +1016,7 @@ impl Plugin for TheTweed {
             create_egui_editor(
                 EguiState::from_size(800, 450),
                 gui::GuiState::new(
-                    ir_status, ir_path, meter_peak_volts,
+                    ir_load_state, ir_path, meter_peak_volts,
                     meter_bplus_volts, meter_v1_volts, meter_v2_volts,
                     meter_6v6_volts, meter_output_db,
                 ),

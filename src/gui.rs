@@ -1,8 +1,9 @@
 use nih_plug::prelude::*;
 use nih_plug_egui::egui::{self, Pos2, Rect, Vec2, ColorImage, TextureHandle};
 use std::sync::{Arc, Mutex, atomic};
+use std::sync::atomic::Ordering;
 
-use crate::{TheTweedParams, ChannelMode};
+use crate::{TheTweedParams, ChannelMode, IrLoadState, ir_load_status, load_ir_file_into_state};
 
 // Embedded image assets
 const CONTROLS_IMAGE: &[u8] = include_bytes!("../gui/controls.png");
@@ -118,7 +119,7 @@ const KNOB_FRAMES: [&[u8]; 100] = [
 ];
 
 pub struct GuiState {
-    pub ir_status: Arc<atomic::AtomicU8>,
+    pub ir_load_state: Arc<IrLoadState>,
     pub ir_path: Arc<Mutex<String>>,
     pub meter_peak_volts: Arc<atomic_float::AtomicF32>,
 
@@ -136,7 +137,7 @@ pub struct GuiState {
 
 impl GuiState {
     pub fn new(
-        ir_status: Arc<atomic::AtomicU8>,
+        ir_load_state: Arc<IrLoadState>,
         ir_path: Arc<Mutex<String>>,
         meter_peak_volts: Arc<atomic_float::AtomicF32>,
         meter_bplus_volts: Arc<atomic_float::AtomicF32>,
@@ -146,7 +147,7 @@ impl GuiState {
         meter_output_db: Arc<atomic_float::AtomicF32>,
     ) -> Self {
         Self {
-            ir_status,
+            ir_load_state,
             ir_path,
             meter_peak_volts,
             meter_bplus_volts,
@@ -173,9 +174,14 @@ pub fn create(
             ui.horizontal(|ui| {
                 ui.label("IR Cabinet:");
 
-                // Browse button to open file dialog
+                // Browse button to open file dialog. The worker thread does
+                // the whole load-and-build pipeline (WAV parse → rubato
+                // resample → normalise → FFT plan) and publishes the finished
+                // convolver to `ir_load_state.pending`. The audio thread picks
+                // it up and crossfades in — see `load_ir_file_into_state` and
+                // `HotSwapConvolver::queue_swap`.
                 if ui.button("Browse...").clicked() {
-                    let ir_status = state.ir_status.clone();
+                    let ir_load_state = state.ir_load_state.clone();
                     let ir_path = state.ir_path.clone();
 
                     // Spawn file dialog using async-std runtime
@@ -187,10 +193,20 @@ pub fn create(
                                 .set_title("Select Impulse Response");
 
                             if let Some(file_handle) = dialog.pick_file().await {
-                                if let Ok(mut path_lock) = ir_path.lock() {
-                                    *path_lock = file_handle.path().display().to_string();
+                                let path = file_handle.path().to_path_buf();
+                                load_ir_file_into_state(&ir_load_state, &path);
+                                // Persist the path ONLY on successful load so
+                                // the DAW session stores a working reference.
+                                // Failed loads leave the prior persisted path
+                                // alone — user can see the failed file in UI
+                                // but it won't be auto-reloaded on restart.
+                                if ir_load_state.status.load(Ordering::Relaxed)
+                                    == ir_load_status::LOADED
+                                {
+                                    if let Ok(mut path_lock) = ir_path.lock() {
+                                        *path_lock = path.display().to_string();
+                                    }
                                 }
-                                ir_status.store(0, atomic::Ordering::Relaxed); // Pending
                             }
                         });
                     });
@@ -198,13 +214,14 @@ pub fn create(
 
                 ui.separator();
 
-                // Status indicator
-                let status = state.ir_status.load(atomic::Ordering::Relaxed);
+                // Status indicator — derived from IrLoadState.
+                let status = state.ir_load_state.status.load(Ordering::Relaxed);
                 let (color, text) = match status {
-                    0 => (egui::Color32::GRAY, "Loading..."),
-                    1 => (egui::Color32::GREEN, "Loaded"),
-                    2 => (egui::Color32::RED, "Failed"),
-                    _ => (egui::Color32::GRAY, "No IR"),
+                    ir_load_status::LOADING => (egui::Color32::GRAY, "Loading..."),
+                    ir_load_status::LOADED => (egui::Color32::GREEN, "Loaded"),
+                    ir_load_status::FAILED => (egui::Color32::RED, "Failed"),
+                    // NO_IR (default) — unity passthrough active.
+                    _ => (egui::Color32::GRAY, "No IR Loaded"),
                 };
 
                 ui.colored_label(color, text);

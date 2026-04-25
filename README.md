@@ -10,6 +10,7 @@ The Tweed is a circuit-level simulation inspired by the 1957 Fender® 5E3 Deluxe
 * The v5 rectifier stage uses a Generic 5Y3 (Koren)
   * Koren fitting based off of General Electric 5Y3 documentation
 * Speaker impedence modelling assumes a Jensen® P12R speaker.
+  * The plugin no longer ships with a default IR file, please see `Using the Plugin` section.
 
 <div style="text-align: center;">
     <img width="50%" src="img/amp.png">
@@ -18,48 +19,39 @@ The Tweed is a circuit-level simulation inspired by the 1957 Fender® 5E3 Deluxe
     <img width="50%" src="img/controls.png">
 </div>
 
+## Recommendations on Sample Rates
+
+The `neampmod-engine` now uses 4x oversampling (down from 8x in v1.x.x) + ADAA1 for tube non-linearities, so the effective sample rate | aliasing rate is:
+
+|Host Sample Rate |Effective Sample Rate |Effective Aliasing Suppression Rate |
+|-----------------|----------------------|------------------------------------|
+|48khz            |192khz                |384khz                              |
+|96khz            |384khz                |768khz                              |
+|192khz           |768khz                |1.54mhz                             |
+
+Unless you have specific needs a 48khz sample rate should be sufficient to prevent aliasing.
+
+NOTE: From testing the reduction from 8x to 4x does seem to have resulted in the higher frequencies poking through a bit more, mainly around the 18khz+.
+
 ## Controls
 
-### Channel Toggle
-
-Toggles between the two available channels, or jumpers channels.
-
-* `N` = Normal channel
-* `J` = Channels jumpered
-* `B` = Bright channel
-
-Volume controls are always active and interactive even if not jumpered, and/ or
-the channel is not active.
-
-### Power Toggle
-
-Turns the amp DSP `on`/ `off` - Note the plugin does not passthru signal when `off`.
-
-### Tone
-
-Controls the tone; This has a large impact on drive.
-
-### Bright Channel Volume
-
-Drives `v1b` and has  `500 nF` bright cap; Channel has more drive and treble than `Normal` channel.
-
-### Normal Channel Volume
-
-Drives `v1a` and is warmer/ thicker than the `Bright` channel.
-
-### AY|AX Toggle
-
-Toggles between a `12AY7` and `12AX7` in the V1 tube socket; Provides earlier and more aggressive breakup.
-
-### Master Knob
-
-Linear fine-tuning volume control at end of circuit after IR, this does not impact gain / tone.
+|Control                |Parameters       |Description                                                                                                                                                              |
+|-----------------------|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|Channel Toggle         |`N`, `J`, `B`    |Toggles between two available channels, or jumpers channels. Volume controls are always active and interactive even if not jumpered, and/ or the channel is not active. |
+|Power Toggle           |`On`, `Off`      |Turns the amp DSP `on`/ `off` - Note the plugin does not passthru signal when `off`. |
+|Tone                   |1-12             |Controls the tone; This has a large impact on drive. |
+|Bright Channel Volume  |1-12             |Drives `v1b` and has `500 nF` bright cap; Channel has more drive and treble than `Normal` channel. |
+|Normal Channel Volume  |1-12             |Drives `v1a` and is warmer/ thicker than the `Bright` channel. |
+|AY/AX Toggle           |`AY`, `AX`       |Toggles between a `12AY7` and `12AX7` in the V1 tube socket; Provides earlier and more aggressive breakup. |
+|Master Knob            |1-12             |Linear fine-tuning volume control at end of circuit after IR, this does not impact gain / tone. |
 
 ### IR Load (Browse Button)
 
 Opens an OS-native file window, navigate to your IR WAV file and load it.
 
-NOTE: The included `default.wav` has audio artifacts/ is low-quality and should be replaced, see below for suggestions on free IRs.
+From version 2.0.0 onwards the plugin ships with **no** default IR — the signal path runs as a unity passthrough until you load one. The status strip reads "No IR Loaded" in this state. See below for suggestions on free IRs.
+
+WAV files at any sample rate (44.1/48/88.2/96/176.4/192 kHz) are supported; the plugin resamples to the host rate on load using a high-quality polyphase FFT resampler. Loading is off the audio thread and swaps in with a short equal-power crossfade so there are no clicks when you switch cabs during playback.
 
 ### Input / Output Trim
 
@@ -80,8 +72,7 @@ The Tweed is available in VST3 and CLAP plugin formats for Linux and Windows.
 To install the plugins copy the `.vst3` to your VST3 directory, and likewise to your `.clap` directory for
 the CLAP plugin.
 
-The plugin includes a `default.wav` IR file, I strongly suggest loading a higher quality IR file to get
-the best out of the plugin; The following sources provide excellent impulse response files:
+The plugin does not ship with a default IR file — you must load your own. The following sources provide excellent impulse response files:
 
 * [Origin Effects IR Cab Library](https://origineffects.com/product/ir-cab-library/)
 * [Tone3000](https://tone3000.com/)
