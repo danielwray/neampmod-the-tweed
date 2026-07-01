@@ -64,7 +64,19 @@ The `Selected:` and `Will apply on next plugin reload` hints in the modal disapp
 |AY/AX Toggle           |`AY`, `AX`       |Swaps V1A and V1B between a `12AY7` (stock) and `12AX7` (higher-mu mod). The `12AX7` gives earlier, more aggressive breakup and a stiffer bright-cap HF lift. Triggers a control-rate rebuild of the V2A grid network. |
 |Master Knob            |1-12             |Linear fine-tuning volume control at end of circuit after IR, this does not impact gain / tone. |
 
-### IR Load (Browse Button)
+### IR vs Dynamic Modelling
+
+Impulse response or dynamic (cabinet, speaker, mic, and room) modelling options are selectable from the `Settings` modal.
+
+#### Dynamic Cabinet
+
+Dynamic cabinet models the Fender Tweed Deluxe 5E3 cabinet, a Jensen P12R 12" speaker, a range of selectable microphones along with exposing options to set the following:
+
+* Mic X         = ```[Cap, Cap Edge, Cone, Cone Edge]```
+* Mic Distance  = ```0.1" - 24"```
+* Room          = ```[None, Small studio, Large Studio, Live Room, Small Bedroom, Wooden Barn, ISO Box]```
+
+#### IR Load (Browse Button)
 
 Opens an OS-native file window, navigate to your IR WAV file and load it.
 
