@@ -65,8 +65,8 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           mkdir -p release-artifacts
-          cp target/bundled/the-tweed.vst3/Contents/x86_64-linux/the-tweed.so \
-             "release-artifacts/neampmod-the-tweed-linux-v${VERSION}.vst3"
+          tar -czf "release-artifacts/neampmod-the-tweed-linux-v${VERSION}.vst3.tar.gz" \
+              -C target/bundled "the-tweed.vst3"
           cp target/bundled/the-tweed.clap \
              "release-artifacts/neampmod-the-tweed-linux-v${VERSION}.clap"
 
@@ -137,8 +137,65 @@ jobs:
           path: neampmod-the-tweed/release-artifacts/
           retention-days: 7
 
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: neampmod-the-tweed
+
+      - name: Checkout engine mirror
+        uses: actions/checkout@v4
+        with:
+          repository: danielwray/neampmod-engine-mirror
+          token: ${{ secrets.ENGINE_TOKEN }}
+          path: neampmod-engine
+
+      - name: Install Rust 1.92
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.92'
+          targets: x86_64-apple-darwin, aarch64-apple-darwin
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: neampmod-the-tweed -> target
+
+      - name: Inject version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: neampmod-the-tweed
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          echo "Building version $VERSION"
+
+      - name: Build universal binary
+        working-directory: neampmod-the-tweed
+        run: cargo run --release -p xtask -- bundle-universal the-tweed --release
+
+      - name: Package macOS artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: neampmod-the-tweed
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p release-artifacts
+          ditto -c -k --sequesterRsrc target/bundled/the-tweed.vst3 \
+              "release-artifacts/neampmod-the-tweed-mac-v${VERSION}.vst3.zip"
+          ditto -c -k --sequesterRsrc target/bundled/the-tweed.clap \
+              "release-artifacts/neampmod-the-tweed-mac-v${VERSION}.clap.zip"
+
+      - name: Upload macOS artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: neampmod-the-tweed/release-artifacts/
+          retention-days: 7
+
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -154,6 +211,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: windows-artifacts
+          path: release-artifacts/
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-artifacts
           path: release-artifacts/
 
       - name: Create GitHub Release

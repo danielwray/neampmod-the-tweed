@@ -3,30 +3,22 @@ name = "the-tweed"
 version = "1.0.0" # default to 1.0.0 as will be replaced in pipeline when building release
 edition = "2024"
 authors = ["NEAMPMOD <daniel.wray.uk+neampmod@gmail.com>"]
-description = "Vintage tweed amplifier simulator inspired by classic 1950s circuits"
+description = "Physics-based amplifier simulator inspired by the 1957 Fender Tweed Deluxe 5e3 amplifier."
 license = "GPL-3.0-or-later"
 
 [lib]
 name = "the_tweed"
 crate-type = ["cdylib", "lib"]
 
-[[bin]]
-name = "the-tweed"
-path = "src/main.rs"
-required-features = []
-
-[build]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
-
 [dependencies]
 # NEAMPMOD DSP Engine - provides all tube modeling, filters, IR convolution
 neampmod-engine = { path = "../neampmod-engine" }
 
-# Audio plugin framework - with LV2 support
+# Audio plugin framework
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = [] }
-lv2 = { version = "0.6", optional = true }
+# lv2 = { version = "0.6", optional = true }
 
-# GUI framework - optional for builds without X11
+# GUI framework
 nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"], optional = true }
 async-std = { version = "1.12", optional = true }
@@ -38,7 +30,7 @@ atomic_float = "1.0"
 [features]
 default = ["gui"]
 gui = ["nih_plug_egui", "rfd", "async-std"]
-lv2 = ["dep:lv2"]
+# lv2 = ["dep:lv2"]
 
 [profile.release]
 opt-level = 3

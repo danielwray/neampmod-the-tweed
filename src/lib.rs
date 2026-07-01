@@ -5,48 +5,55 @@ use std::sync::atomic::Ordering;
 #[cfg(feature = "gui")]
 mod gui;
 
-// Import DSP from neampmod-engine
 use neampmod_engine::{
-    // Tube modeling (preamp only — power section handled by AmpTopology)
     TubeStage,
     TubeRegistry,
-    // AmpTopology (replaces manual power section + power supply + speaker impedance)
     AmpTopology,
     AmpTopologyConfig,
     BPlusTap,
-    ImpedanceConfig,
-    // Filters
-    DCBlocker,
-    NthOrderTdfii,
-    // MNA mixing + tone network
-    MnaSystem,
-    PassiveNetworkSpec,
-    // Calibration
-    InputCalibration,
-    OutputCalibration,
-    // Input level metering
-    InputLevelMeter,
-    // Coupling capacitors (preamp only — PI-to-power coupling handled by AmpTopology)
     CouplingCapacitor,
-    // Amp-referenced output normalizer (physical OT secondary volts → ±1 audio).
-    OutputNormalizer,
-    // TransformerRegistry: spec-driven OT construction (5E3 bobbin-wound early)
-    TransformerRegistry,
-    // SpeakerModel still needed for ImpedanceConfig in AmpTopology (impedance-curve
-    // selection lives on the electrical side of the power section, independent of
-    // the voltage normalization used for the IR path).
-    SpeakerModel,
-    // IR loader and convolver
+    DCBlocker,
+    InputCalibration,
+    InputLevelMeter,
+    LoadboxDi,
     ir_loader,
     ir_convolver,
-    // Pot taper modeling
     PotTaper,
     PotTaperConfig,
-    // Input jack modeling
     JackInput,
+    enable_audio_thread_denormal_handling,
+    EngineRate,
+    OversamplingFactor,
+    X1Boundary,
+    X2Boundary,
+    X4Boundary,
+    X8Boundary,
+    InnerDspProcessor,
+    DspEngine,
+    SpeakerCabRoomProcessor,
+    SpeakerCabRoomConfig,
+    SpeakerWiring,
+    MicrophonePlacement,
+};
+use neampmod_engine::dsp::amps::tube_modeling::{
+    SharedCathodeTriodePair, SharedCathodeTriodePairConfig, TubeSpec,
+};
+use neampmod_engine::dsp::circuits::mna_circuit::{
+    GridBiasType, GridConductionConfig, MnaCircuit, MnaCircuitBuilder, PotHandle,
+    PotSmoother, GND,
 };
 
 const IR_CROSSFADE_MS: f32 = 30.0;
+
+// GUI metering cadence: plate/B+/level values are accumulated over this
+// window and published to the GUI atomics once per window, rather than
+// every buffer.
+const METER_UPDATE_INTERVAL_MS: f32 = 100.0;
+
+// Must match the OT-load speaker in `AmpTopologyConfig::fender_5e3()` —
+// the 5E3 shipped with a Jensen P12R, open-back 1x12.
+const DEFAULT_SPEAKER_ID: &str = "jensen_p12r";
+const DEFAULT_CABINET_ID: &str = "fender_5e3_open_back_1x12";
 
 pub struct IrLoadState {
     pub pending: Mutex<Option<ir_convolver::ZeroLatencyConvolver>>,
@@ -82,6 +89,56 @@ impl Default for IrLoadState {
     fn default() -> Self { Self::new() }
 }
 
+// Hot-swap slot: GUI builds a fresh SpeakerCabRoomProcessor and writes it
+// here; the audio thread try_locks once per buffer and swaps it in.
+pub struct CabProcessorLoadState {
+    pub pending: Mutex<Option<SpeakerCabRoomProcessor>>,
+}
+
+impl CabProcessorLoadState {
+    pub fn new() -> Self {
+        Self { pending: Mutex::new(None) }
+    }
+}
+
+impl Default for CabProcessorLoadState {
+    fn default() -> Self { Self::new() }
+}
+
+// Panics on unknown registry ids — callers must pass ids present in the
+// relevant compile-time registry.
+pub fn build_cab_processor(
+    sample_rate: f32,
+    max_buffer_size: usize,
+    speaker_id: &str,
+    cabinet_id: &str,
+    microphone_id: &str,
+    room: RoomSelection,
+    placement: MicrophonePlacement,
+) -> SpeakerCabRoomProcessor {
+    let (room_id, room_enabled) = room.into_engine();
+    SpeakerCabRoomProcessor::new(
+        sample_rate,
+        max_buffer_size,
+        SpeakerCabRoomConfig {
+            // 5E3 is a 1x12 — single driver, matches the OT-load speaker.
+            speaker_wiring: SpeakerWiring::single(speaker_id),
+            cabinet_id: cabinet_id.to_string(),
+            microphone_id: microphone_id.to_string(),
+            placement,
+            room_id: room_id.to_string(),
+            // Lockstep with LoadboxDi's -10 dB pad so both cab arms land
+            // in the same dBFS region.
+            mic_preamp_gain_db: 35.0,
+            speaker_enabled: true,
+            cabinet_enabled: true,
+            mic_enabled: true,
+            room_enabled,
+            response_enabled: true,
+        },
+    )
+}
+
 pub fn load_ir_file_into_state(state: &IrLoadState, path: &std::path::Path) {
     state.status.store(ir_load_status::LOADING, Ordering::Relaxed);
 
@@ -92,7 +149,7 @@ pub fn load_ir_file_into_state(state: &IrLoadState, path: &std::path::Path) {
     match loader.load_from_file(path) {
         Ok((mut ir, _, _)) => {
             ir_loader::IrLoader::remove_dc_offset(&mut ir);
-            ir_loader::IrLoader::normalize_rms(&mut ir, -12.0);
+            ir_loader::IrLoader::normalize_response_peak(&mut ir);
             let fir_len = 128.min(block_size);
             let conv = ir_convolver::ZeroLatencyConvolver::new(&ir, block_size, fir_len);
             if let Ok(mut pending) = state.pending.lock() {
@@ -106,7 +163,6 @@ pub fn load_ir_file_into_state(state: &IrLoadState, path: &std::path::Path) {
     }
 }
 
-/// Maps internal 0.0–1.0 parameter value to 5E3 faceplate numbering (1–12).
 fn v2s_dial_1_to_12() -> Arc<dyn Fn(f32) -> String + Send + Sync> {
     Arc::new(move |value: f32| {
         let dial = 1.0 + value * 11.0;
@@ -118,7 +174,6 @@ fn v2s_dial_1_to_12() -> Arc<dyn Fn(f32) -> String + Send + Sync> {
     })
 }
 
-/// Parses 5E3 faceplate numbering (1–12) back to internal 0.0–1.0.
 fn s2v_dial_1_to_12() -> Arc<dyn Fn(&str) -> Option<f32> + Send + Sync> {
     Arc::new(|string: &str| {
         let dial: f32 = string.trim().parse().ok()?;
@@ -139,82 +194,203 @@ pub enum ChannelMode {
     Bright,
 }
 
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CabModellingMode {
+    #[id = "ir"]
+    #[name = "IR"]
+    Ir,
+    #[id = "dynamic"]
+    #[name = "Dynamic"]
+    Dynamic,
+}
+
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicXPosition {
+    #[id = "cap"]
+    #[name = "Cap"]
+    Cap,
+    #[id = "cap_edge"]
+    #[name = "Cap Edge"]
+    CapEdge,
+    #[id = "cone"]
+    #[name = "Cone"]
+    Cone,
+    #[id = "cone_edge"]
+    #[name = "Cone Edge"]
+    ConeEdge,
+}
+
+impl MicXPosition {
+    // Radial offset from speaker centre, in cm — calibrated for a 12" driver.
+    pub fn radial_offset_cm(self) -> f32 {
+        match self {
+            MicXPosition::Cap => 0.0,
+            MicXPosition::CapEdge => 3.0,
+            MicXPosition::Cone => 8.0,
+            MicXPosition::ConeEdge => 14.0,
+        }
+    }
+}
+
+// Kept in sync with `assets/config/microphones/v1/*.toml` in the engine.
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicSelection {
+    #[id = "shure_sm57"]
+    #[name = "Shure SM57"]
+    ShureSm57,
+    #[id = "sennheiser_md421"]
+    #[name = "Sennheiser MD 421-II"]
+    SennheiserMd421,
+    #[id = "royer_r121"]
+    #[name = "Royer R-121 Ribbon"]
+    RoyerR121,
+    #[id = "neumann_u87"]
+    #[name = "Neumann U 87 Ai (Cardioid)"]
+    NeumannU87,
+    #[id = "rca_44bx"]
+    #[name = "RCA 44-BX"]
+    Rca44Bx,
+    #[id = "rca_77dx"]
+    #[name = "RCA 77-DX"]
+    Rca77Dx,
+}
+
+impl MicSelection {
+    pub fn registry_id(self) -> &'static str {
+        match self {
+            MicSelection::ShureSm57 => "shure_sm57",
+            MicSelection::SennheiserMd421 => "sennheiser_md421",
+            MicSelection::RoyerR121 => "royer_r121",
+            MicSelection::NeumannU87 => "neumann_u87",
+            MicSelection::Rca44Bx => "rca_44bx",
+            MicSelection::Rca77Dx => "rca_77dx",
+        }
+    }
+}
+
+// Maps each variant to an engine room-registry id plus a wet on/off flag.
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomSelection {
+    #[id = "none"]
+    #[name = "None"]
+    None,
+    #[id = "small_studio"]
+    #[name = "Small Studio"]
+    SmallStudio,
+    #[id = "large_studio"]
+    #[name = "Large Studio"]
+    LargeStudio,
+    #[id = "live_room"]
+    #[name = "Live Room"]
+    LiveRoom,
+    #[id = "small_bedroom"]
+    #[name = "Small Bedroom"]
+    WoodenBarn,
+    #[id = "wooden_barn"]
+    #[name = "Wooden Barn"]
+    SmallBedroom,
+    #[id = "iso_box"]
+    #[name = "Iso Box"]
+    IsoBox,
+}
+
+impl RoomSelection {
+    // `None` still resolves to a real id so the processor builds; the room
+    // stage is simply disabled via the flag.
+    pub fn into_engine(self) -> (&'static str, bool) {
+        match self {
+            RoomSelection::None => ("small_studio", false),
+            RoomSelection::SmallStudio => ("small_studio", true),
+            RoomSelection::LargeStudio => ("large_studio", true),
+            RoomSelection::LiveRoom => ("live_room", true),
+            RoomSelection::WoodenBarn => ("wooden_barn", true),
+            RoomSelection::SmallBedroom => ("small_bedroom", true),
+            RoomSelection::IsoBox => ("iso_box", true),
+        }
+    }
+}
+
 #[derive(Params)]
 struct TheTweedParams {
-    /// Bright channel volume - drives V1B preamp saturation
     #[id = "bright_volume"]
     pub bright_volume: FloatParam,
 
-    /// Normal channel volume - drives V1A preamp saturation
     #[id = "normal_volume"]
     pub normal_volume: FloatParam,
 
-    /// Channel selector - Normal / Both (jumpered) / Bright
     #[id = "channel_select"]
     pub channel_select: EnumParam<ChannelMode>,
 
-    /// Tone control - treble/bass balance
     #[id = "tone"]
     pub tone: FloatParam,
 
-    /// Master power switch
     #[id = "power"]
     pub power: BoolParam,
 
-    /// V1 tube toggle - switches between stock tube (off) and mod tube (on)
     #[id = "tube_toggle"]
     pub tube_toggle: BoolParam,
 
-    /// Master volume - final output level control
     #[id = "master"]
     pub master: FloatParam,
 
-    /// Input calibration trim - adjusts input sensitivity
-    /// Range: -12 dB to +12 dB for interface matching
     #[id = "input_trim"]
     pub input_trim_db: FloatParam,
 
-    /// Output calibration trim - adjusts final output level
-    /// Range: -24 dB to 0 dB for mixing headroom
     #[id = "output_trim"]
     pub output_trim_db: FloatParam,
 
-    /// IR file path - persisted with DAW session state
+    #[id = "cab_modelling_mode"]
+    pub cab_modelling_mode: EnumParam<CabModellingMode>,
+
+    #[id = "mic_x_position"]
+    pub mic_x_position: EnumParam<MicXPosition>,
+
+    #[id = "mic_distance_inches"]
+    pub mic_distance_inches: FloatParam,
+
+    // Cabinet and speaker are locked to the 5E3 defaults, not exposed as params.
+    #[id = "microphone"]
+    pub microphone: EnumParam<MicSelection>,
+
+    #[id = "room_selection"]
+    pub room_selection: EnumParam<RoomSelection>,
+
     #[persist = "ir_path"]
     pub ir_file_path: Arc<Mutex<String>>,
+
+    // Persisted as a string proxy since OversamplingFactor doesn't
+    // implement Serialize/Deserialize. Applied on next plugin reload.
+    #[persist = "oversampling_factor"]
+    pub oversampling_factor: Arc<Mutex<String>>,
 }
 
 
 impl Default for TheTweedParams {
     fn default() -> Self {
         Self {
-            // Bright channel volume - drives V1B preamp saturation
             bright_volume: FloatParam::new(
                 "Bright",
-                0.42,
+                0.38,
                 FloatRange::Linear { min: 0.01, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Logarithmic(10.0))
             .with_value_to_string(v2s_dial_1_to_12())
             .with_string_to_value(s2v_dial_1_to_12()),
 
-            // Normal channel volume - drives V1A preamp saturation
             normal_volume: FloatParam::new(
                 "Normal",
-                0.35,
+                0.29,
                 FloatRange::Linear { min: 0.01, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Logarithmic(10.0))
             .with_value_to_string(v2s_dial_1_to_12())
             .with_string_to_value(s2v_dial_1_to_12()),
 
-            // Channel selector - Normal / Both (jumpered, default) / Bright
             channel_select: EnumParam::new("Channel", ChannelMode::Both),
 
-            // Tone control
             tone: FloatParam::new(
                 "Tone",
-                0.4,
+                0.54,
                 FloatRange::Linear { min: 0.01, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Logarithmic(5.0))
@@ -223,23 +399,20 @@ impl Default for TheTweedParams {
 
             power: BoolParam::new("Power", true),
 
-            // Tube toggle - switches V1 between stock and mod
             tube_toggle: BoolParam::new("Tube Toggle", false),
 
-            // Master volume - final output level control
             master: FloatParam::new(
                 "Master",
-                0.3,
+                0.6,
                 FloatRange::Linear { min: 0.0001, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Logarithmic(10.0))
             .with_value_to_string(v2s_dial_1_to_12())
             .with_string_to_value(s2v_dial_1_to_12()),
 
-            // Input calibration trim
             input_trim_db: FloatParam::new(
                 "Input Trim",
-                0.0,  // No adjustment by default
+                0.0,
                 FloatRange::Linear { min: -18.0, max: 12.0 },
             )
             .with_unit(" dB")
@@ -248,10 +421,9 @@ impl Default for TheTweedParams {
             .with_value_to_string(formatters::v2s_f32_rounded(1))
             .with_string_to_value(Arc::new(|s: &str| s.trim().parse().ok())),
 
-            // Output calibration trim
             output_trim_db: FloatParam::new(
                 "Output Trim",
-                0.0,  // Additional trim on top of engine's 0db pro_audio_headroom()
+                0.0,
                 FloatRange::Linear { min: -24.0, max: 0.0 },
             )
             .with_unit(" dB")
@@ -260,157 +432,97 @@ impl Default for TheTweedParams {
             .with_value_to_string(formatters::v2s_f32_rounded(1))
             .with_string_to_value(Arc::new(|s: &str| s.trim().parse().ok())),
 
-            // IR file path - persisted with DAW session. Empty string means
-            // "no IR loaded" — the signal path runs as a unity passthrough.
+            cab_modelling_mode: EnumParam::new(
+                "Cab Modelling",
+                CabModellingMode::Dynamic,
+            ),
+
+            mic_x_position: EnumParam::new("Mic X", MicXPosition::CapEdge),
+
+            mic_distance_inches: FloatParam::new(
+                "Mic Distance",
+                4.0,
+                FloatRange::Linear { min: 0.1, max: 24.0 },
+            )
+            .with_unit(" in")
+            .with_step_size(0.1)
+            .with_smoother(SmoothingStyle::Linear(20.0))
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_string_to_value(Arc::new(|s: &str| s.trim().parse().ok())),
+
+            microphone: EnumParam::new("Mic", MicSelection::Rca77Dx),
+            room_selection: EnumParam::new(
+                "Room",
+                RoomSelection::SmallStudio,
+            ),
+
             ir_file_path: Arc::new(Mutex::new(String::new())),
+
+            // Default OS factor: X4 (matches the engine's production default).
+            oversampling_factor: Arc::new(Mutex::new(
+                os_factor_str(OversamplingFactor::X4).to_string(),
+            )),
         }
     }
 }
 
-/// Build the 5E3 AmpTopology configuration.
-///
-/// Uses the engine's fender_5e3() preset (cathodyne PI, 6V6 PP, SmallAmerican OT,
-/// 5Y3 rectifier, JensenP12 impedance with 0.75 open-back factor, 3-tap B+ topology)
-/// with current tracking enabled for authentic sag response.
+// =============================================================================
+// OS-factor helpers (string proxy used for NIH-plug `#[persist]` serialisation)
+// =============================================================================
+
+pub fn parse_os_factor(s: &str) -> OversamplingFactor {
+    match s {
+        "X1" => OversamplingFactor::X1,
+        "X4" => OversamplingFactor::X4,
+        "X8" => OversamplingFactor::X8,
+        // "X2" is default
+        _ => OversamplingFactor::X2,
+    }
+}
+
+pub fn os_factor_str(f: OversamplingFactor) -> &'static str {
+    match f {
+        OversamplingFactor::X1 => "X1",
+        OversamplingFactor::X2 => "X2",
+        OversamplingFactor::X4 => "X4",
+        OversamplingFactor::X8 => "X8",
+    }
+}
+
+pub fn os_factor_label(f: OversamplingFactor) -> &'static str {
+    match f {
+        OversamplingFactor::X1 => "1x (none)",
+        OversamplingFactor::X2 => "2x",
+        OversamplingFactor::X4 => "4x",
+        OversamplingFactor::X8 => "8x",
+    }
+}
+
 fn build_5e3_amp_topology_config() -> AmpTopologyConfig {
     let mut config = AmpTopologyConfig::fender_5e3();
-    // Power-tube current is now auto-wired into the PSU per-sample by
-    // AmpTopology::process_power_section; the old with_current_tracking shim
-    // was removed with the Phase 1/2 voltage-domain PSU rewrite.
-    config.power_section.power_tube_spec = Some(POWER_TUBE_SPEC.into());
-    config.power_section.pi_spec = Some(PI_SPEC.into());
-    config.power_section.transformer_spec = Some(OT_SPEC.into());
+    config.power_section.transformer_spec = OT_SPEC.into();
     config.power_supply.sag.rectifier_spec = Some(RECTIFIER_SPEC.into());
-    config.impedance = Some(ImpedanceConfig {
-        speaker_model: Some(SpeakerModel::JensenP),
-        cabinet_factor_override: Some(0.75),
-        ..Default::default()
-    });
     config
 }
 
-pub struct TheTweed {
-    params: Arc<TheTweedParams>,
-    sample_rate: f32,
-
-    // === Input ===
-    input_cal: InputCalibration,
-    jack_input: JackInput,
-    output_cal: OutputCalibration,
-
-    // Unified MNA mixing + tone network (replaces BrightChannelFilter, manual mixing, ToneStack5E3)
-    // Two transfer functions — one per input channel — solved from the same 5E3 passive netlist.
-    // Controls: [normal_wiper, bright_wiper, tone] — updated per-sample with change detection.
-    mna_normal: MnaSystem,      // H(s): V1A coupling cap -> V2A grid
-    mna_bright: MnaSystem,      // H(s): V1B coupling cap -> V2A grid
-    filter_normal: NthOrderTdfii,
-    filter_bright: NthOrderTdfii,
-    mixing_tone_controls: [f64; 3],  // cached for change detection
-
-    // Preamp tube stages (Koren physics-based LUTs)
-    // V1A (Normal channel) — two halves of the same tube
-    v1a_tube_stock: TubeStage,
-    v1a_tube_mod: TubeStage,
-    // V1B (Bright channel) — other half of V1
-    v1b_tube_stock: TubeStage,
-    v1b_tube_mod: TubeStage,
-    v2a_tube: TubeStage,
-
-    // Passive coupling capacitors (DC blocking, preamp only)
-    // V1 plate → volume/mixing network: 0.1µF into 1MΩ
-    coupling_v1: CouplingCapacitor,
-    coupling_v1b: CouplingCapacitor,
-    // V2A plate → PI grid: passive coupling (cathodyne PI cathode at ~165V,
-    // so V_gk ≈ -165V — grid conduction is physically impossible)
-    coupling_v2a: CouplingCapacitor,
-
-    // === AmpTopology: PI → power tubes → OT → speaker impedance ===
-    // Replaces manual power section wiring. Handles:
-    //   - Cathodyne Phase inverter
-    //   - PI / 6V6 coupling caps + interstage attenuation
-    //   - Push-pull 6V6 power tubes with screen sag + cathode bias
-    //   - Output transformer (SmallAmerican) with core saturation + leakage
-    //   - Speaker impedance EQ (JensenP12, open-back 0.75)
-    //   - Power supply (5Y3 sag + ripple + 3-tap B+ topology)
-    //   - All internal feedback loops (screen sag, cathode bias, sag→B+)
-    amp_topology: AmpTopology,
-    // B+ tap handles, resolved once per AmpTopology lifetime to avoid per-sample
-    // string lookups. Refreshed in `initialize()` after `AmpTopology::new`.
-    preamp_tap: BPlusTap,
-    power_tube_tap: BPlusTap,
-
-    // === Output Normalizer (physical OT secondary volts → normalized ±1 for IR) ===
-    // Amp-referenced: divisor is derived from the 5E3's rail and OT turns ratio,
-    // not from the loaded speaker's rated power.
-    output_normalizer: OutputNormalizer,
-
-    // === IR Convolution ===
-    ir_convolver: ir_convolver::HotSwapConvolver,
-    ir_load_state: Arc<IrLoadState>,
-    pre_ir_buffer: Vec<f32>,
-    post_ir_buffer: Vec<f32>,
-    ir_block_size: usize,
-    /// Crossfade length in samples, recomputed at `initialize()` time from
-    /// `IR_CROSSFADE_MS * sample_rate`. Passed to `HotSwapConvolver::queue_swap`.
-    ir_crossfade_samples: usize,
-
-    // Volume pot taper (1MΩ 15A audio taper, same for both channels)
-    volume_taper: PotTaperConfig,
-    dc_blocker_output: DCBlocker,
-
-    // Input level meter (measures raw DAW signal, classifies operating zone)
-    input_meter: InputLevelMeter,
-    cached_input_trim_db: f32,
-    cached_tube_toggle: bool,
-
-    // Shared with GUI (written once per buffer from audio thread)
-    meter_peak_volts: Arc<atomic_float::AtomicF32>,
-    // Circuit-stats modal: per-buffer physical-voltage snapshots
-    meter_bplus_volts: Arc<atomic_float::AtomicF32>,   // B+1 (power-tube tap) from PSU
-    meter_v1_volts: Arc<atomic_float::AtomicF32>,      // Active V1A plate-pin V, buffer mean
-    meter_v2_volts: Arc<atomic_float::AtomicF32>,      // V2A plate-pin V, buffer mean
-    meter_6v6_volts: Arc<atomic_float::AtomicF32>,     // 6V6 (pos tube) plate-pin V, buffer mean
-    meter_output_db: Arc<atomic_float::AtomicF32>,     // Post-master peak output, dB
-
-}
-
-// -- Power Supply ---
-/// 5E3 preamp B+ voltage (B+3 tap after filter chain)
 const PREAMP_BPLUS_5E3: f32 = 250.0;
-/// 5E3 power-tube plate B+ (OT centre tap, B+1 tap; matches the nominal value
-/// in the engine's `AmpTopologyConfig::fender_5e3` preset). Used as the rail
-/// reference for `OutputNormalizer` — nominal value, not sag-modulated.
-const POWER_BPLUS_5E3: f32 = 350.0;
 
-// --- Tubes ---
-/// V1 stock tube — General Electric 12ay7
 const V1_STOCK_SPEC: &str = "ge_12ay7_100k";
-/// V1 mod tube — RCA 12AX7A
-const V1_MOD_SPEC: &str = "rca_12ax7a_100k";
-/// V2A gain stage — RCA 12ax7A
-const V2A_SPEC: &str = "rca_12ax7a_100k";
-/// Phase inverter — General Electric 12ax7 cathodyne
-const PI_SPEC: &str = "ge_12ax7_cathodyne_56k";
-/// Power tubes — RCA 6V6GTA configured for 5E3
-const POWER_TUBE_SPEC: &str = "rca_6v6gta_5e3";
-/// Rectifier — 5Y3
-const RECTIFIER_SPEC: &str = "5y3";
-/// Output transformer — early bobbin-wound 5E3 (TweedEraSilicon + BobbinWound)
-const OT_SPEC: &str = "fender_tweed_deluxe_5e3_early_bobbin";
-
-// --- 5E3 cathode circuit values ---
-/// V1 shared cathode resistor (Ω)
+const V1_MOD_SPEC: &str = "ge_12ax7_100k";
+const V2A_SPEC: &str = "ge_12ax7_100k";
+const RECTIFIER_SPEC: &str = "ge_5y3";
+const OT_SPEC: &str = "sst_108";
 const V1_CATHODE_R: f32 = 820.0;
-/// V1 cathode bypass cap (µF)
 const V1_CATHODE_CAP: f32 = 25.0;
-/// V2A cathode resistor (Ω)
 const V2A_CATHODE_R: f32 = 1500.0;
-/// V2A cathode bypass cap (µF)
 const V2A_CATHODE_CAP: f32 = 25.0;
+const V2A_TO_V2B_COUPLING_CAP_F: f32 = 0.02e-6;
+const V2B_GRID_LEAK_OHMS: f32 = 1_000_000.0;
 
-/// Build a preamp TubeStage from the registry with 5E3 plate voltage.
+const POT_SMOOTH_TAU_S: f32 = 0.020;
+
 fn build_preamp_tube(
-    sample_rate: f32,
+    engine_rate: EngineRate,
     spec_name: &str,
     cathode_resistor_ohms: f32,
     cathode_bypass_cap_uf: Option<f32>,
@@ -418,122 +530,676 @@ fn build_preamp_tube(
     let reg = TubeRegistry::global();
     let spec = reg.lookup(spec_name)
         .unwrap_or_else(|| panic!("Tube spec '{}' not found in registry", spec_name));
-    let mut stage = TubeStage::from_spec(sample_rate, spec, cathode_resistor_ohms, cathode_bypass_cap_uf)
-        .unwrap_or_else(|e| panic!("Failed to build tube from spec '{}': {}", spec_name, e));
+    let mut stage = TubeStage::from_spec(
+        engine_rate,
+        spec,
+        cathode_resistor_ohms,
+        cathode_bypass_cap_uf,
+    )
+    .unwrap_or_else(|e| panic!("Failed to build tube from spec '{}': {}", spec_name, e));
     stage.set_plate_bplus_voltage(PREAMP_BPLUS_5E3);
     stage
 }
 
-/// Compute the meter ceiling at the amp jack for a given V1 tube stage.
-/// ceiling = clean_ac_ceiling_volts / jack.dc_gain()
-fn meter_ceiling_for_tube(tube: &TubeStage, jack: &JackInput) -> f32 {
-    tube.voltage_cal().clean_ac_ceiling_volts() / jack.dc_gain()
+// V1 (12AY7 stock / 12AX7 mod) is one shared-cathode triode pair: triode A
+// is the Normal grid, triode B is Bright, sharing an 820Ω/25µF cathode RC.
+// The shared cathode integrator is what produces the 5E3's cross-channel
+// ducking — a hard drive into one grid biases both triodes toward cutoff.
+fn build_v1_pair(
+    engine_rate: EngineRate,
+    spec_name: &str,
+) -> SharedCathodeTriodePair {
+    let config = SharedCathodeTriodePairConfig {
+        tube_spec: spec_name.into(),
+        shared_cathode_resistor_ohms: V1_CATHODE_R,
+        shared_cathode_bypass_cap_uf: Some(V1_CATHODE_CAP),
+        shared_cathode_bypass_dielectric: Some("electrolytic_vintage".into()),
+        plate_resistor_a_ohms: 100_000.0,
+        plate_resistor_b_ohms: 100_000.0,
+        tube_mismatch: Some(0.05),
+        linear_blend_threshold: None,
+        plate_voltage_fraction: 1.0,
+    };
+    let mut pair = SharedCathodeTriodePair::from_config(engine_rate, config)
+        .unwrap_or_else(|e| panic!("V1 pair build for '{}': {}", spec_name, e));
+    pair.set_plate_bplus_voltage(PREAMP_BPLUS_5E3);
+    pair
+}
+
+// V2A's grid network (V1 mixing + bright cap + tone shunt + grid
+// conduction) is attached separately via `set_grid_circuit` — see
+// `V2aGridNetwork` below. V2A→V2B is a plain 0.02µF/1MΩ coupling cap.
+fn build_v2a_tube(engine_rate: EngineRate) -> TubeStage {
+    build_preamp_tube(
+        engine_rate,
+        V2A_SPEC,
+        V2A_CATHODE_R,
+        Some(V2A_CATHODE_CAP),
+    )
+}
+
+// Tube-plate Thévenin source impedance: R_load ∥ r_p.
+fn plate_source_impedance(spec: &TubeSpec) -> f32 {
+    let rp = spec.rp;
+    let rl = spec.plate_resistor_ohms;
+    rp * rl / (rp + rl)
+}
+
+// Passive subcircuit between the V1 plates and V2A's grid: each V1 plate
+// feeds a 0.1µF coupling cap into a 1MΩ volume pot (500pF bright cap
+// across the Bright pot's upper half), and both wipers join through 68kΩ
+// mixing resistors at V2A's grid. Tone is a shunt-to-ground rheostat at
+// that same grid node — 1MΩ pot in series with a 5nF cap to ground (the
+// pot's `top` and `wiper` tie to the same node to make a 2-terminal
+// rheostat from the 3-terminal primitive). Grid conduction is stamped at
+// V2A's grid; the volume pots double as its DC grid leak.
+//
+// Driver order is load-bearing: handle 0 is V1A plate, handle 1 is V1B
+// plate — must match the `process_multi(&[v1a, v1b], ...)` call site.
+struct V2aGridNetwork {
+    circuit: MnaCircuit,
+    norm_volume: PotHandle,
+    bright_volume: PotHandle,
+    tone: PotHandle,
+}
+
+impl V2aGridNetwork {
+    const COUPLING_CAP_F: f32 = 0.1e-6;
+    const VOLUME_POT_OHMS: f32 = 1_000_000.0;
+    const BRIGHT_CAP_F: f32 = 500e-12;
+    const MIXING_R_OHMS: f32 = 68_000.0;
+    const TONE_POT_OHMS: f32 = 1_000_000.0;
+    const TONE_CAP_F: f32 = 5e-9;
+
+    fn new(engine_rate: EngineRate, v1_source_z_ohms: f32) -> Self {
+        let v2a_spec = TubeRegistry::global()
+            .lookup(V2A_SPEC)
+            .unwrap_or_else(|| panic!("Tube spec '{}' not found in registry", V2A_SPEC));
+
+        let mut b = MnaCircuitBuilder::new(engine_rate);
+
+        let (v1a, _drv_v1a) = b.add_driver("v1a_plate");
+        let (v1b, _drv_v1b) = b.add_driver("v1b_plate");
+
+        let v1a_after_src = b.node("v1a_after_src");
+        let norm_pot_top = b.node("norm_pot_top");
+        let norm_wiper = b.node("norm_wiper");
+        let v2a_grid = b.node("v2a_grid");
+        b.resistor(v1a, v1a_after_src, v1_source_z_ohms)
+            .capacitor(v1a_after_src, norm_pot_top, Self::COUPLING_CAP_F);
+        let (norm_volume, _) =
+            b.pot(norm_pot_top, norm_wiper, GND, Self::VOLUME_POT_OHMS, 1.0);
+        b.resistor(norm_wiper, v2a_grid, Self::MIXING_R_OHMS);
+
+        let v1b_after_src = b.node("v1b_after_src");
+        let bright_pot_top = b.node("bright_pot_top");
+        let bright_wiper = b.node("bright_wiper");
+        b.resistor(v1b, v1b_after_src, v1_source_z_ohms)
+            .capacitor(v1b_after_src, bright_pot_top, Self::COUPLING_CAP_F);
+        let (bright_volume, _) =
+            b.pot(bright_pot_top, bright_wiper, GND, Self::VOLUME_POT_OHMS, 0.0);
+        b.capacitor(bright_pot_top, bright_wiper, Self::BRIGHT_CAP_F)
+            .resistor(bright_wiper, v2a_grid, Self::MIXING_R_OHMS);
+
+        let tone_internal = b.node("tone_internal");
+        let (tone, _) = b.pot(
+            tone_internal,
+            tone_internal,
+            v2a_grid,
+            Self::TONE_POT_OHMS,
+            1.0,
+        );
+        b.capacitor(tone_internal, GND, Self::TONE_CAP_F);
+
+        // V2A's reflected Miller capacitance at the grid node forms the
+        // 5E3's interactive-volume treble pole against the mixer's
+        // pot-position-dependent source impedance.
+        b.capacitor(v2a_grid, GND, v2a_spec.miller_c_eff_farads());
+
+        b.grid_conduction(
+            v2a_grid,
+            GridConductionConfig {
+                grid_perveance: v2a_spec.grid_perveance,
+                contact_potential: v2a_spec.threshold.abs(),
+                bias_type: GridBiasType::CathodeBias {
+                    cathode_voltage: -v2a_spec.bias_voltage,
+                },
+            },
+        );
+        b.set_output(v2a_grid);
+
+        let circuit = b
+            .build()
+            .expect("5E3 V2A grid network is well-formed");
+
+        Self {
+            circuit,
+            norm_volume,
+            bright_volume,
+            tone,
+        }
+    }
+}
+
+fn meter_ceiling_for_pair(pair: &SharedCathodeTriodePair, jack: &JackInput) -> f32 {
+    pair.voltage_cal().clean_ac_ceiling_volts() / jack.dc_gain()
+}
+
+// =============================================================================
+// TweedInner — per-amp inner-rate DSP processor
+// =============================================================================
+
+// Per-inner-sample DSP graph: V1 dual-triode pair (Normal/Bright split) →
+// V2A (with attached grid network) → V2A→V2B coupling cap → AmpTopology
+// power section (cathodyne PI → push-pull 6V6 → OT).
+pub struct TweedInner {
+    // Both halves of the pair always process per sample so the shared
+    // cathode integrator captures cross-channel ducking correctly.
+    pub v1_pair_stock: SharedCathodeTriodePair,
+    pub v1_pair_mod: SharedCathodeTriodePair,
+    pub current_tube_toggle: bool,
+
+    pub v2a_tube: TubeStage,
+    pub grid_norm_handle: PotHandle,
+    pub grid_bright_handle: PotHandle,
+    pub grid_tone_handle: PotHandle,
+    // Ticked at host rate in `begin_host_sample`; targets set per-buffer.
+    pub norm_smoother: PotSmoother,
+    pub bright_smoother: PotSmoother,
+    pub tone_smoother: PotSmoother,
+    // V2A plate → V2B (cathodyne) grid coupling: 0.02µF/1MΩ, ~8Hz HP.
+    pub coupling_v2a: CouplingCapacitor,
+
+    pub amp_topology: AmpTopology,
+    pub preamp_tap: BPlusTap,
+    pub power_tube_tap: BPlusTap,
+
+    pub current_channel_mode: ChannelMode,
+
+    // Per-buffer accumulators for PSU drain, drained in `end_buffer`.
+    // Part of the physics (power-supply loading) — never decimated.
+    pub preamp_current_sum: f32,
+    pub preamp_current_count: u32,
+
+    // GUI-only metering: plate voltages sampled once per host sample
+    // (not per inner/oversampled sample) and accumulated across buffers
+    // until the plugin drains them at the METER_UPDATE_INTERVAL_MS cadence.
+    pub meter_this_host_sample: bool,
+    pub v1_plate_sum: f32,
+    pub v2_plate_sum: f32,
+    pub v3v4_plate_sum: f32,
+    pub plate_samples_counted: u32,
+}
+
+impl TweedInner {
+    fn reset_plate_meters(&mut self) {
+        self.v1_plate_sum = 0.0;
+        self.v2_plate_sum = 0.0;
+        self.v3v4_plate_sum = 0.0;
+        self.plate_samples_counted = 0;
+    }
+}
+
+impl InnerDspProcessor for TweedInner {
+    fn begin_buffer(&mut self, n: usize) {
+        self.amp_topology.begin_buffer(n);
+        self.preamp_current_sum = 0.0;
+        self.preamp_current_count = 0;
+        // Plate meters deliberately NOT reset here — they accumulate
+        // across buffers until the metering window closes.
+    }
+
+    fn begin_host_sample(&mut self) {
+        self.amp_topology.advance_sample();
+        self.meter_this_host_sample = true;
+
+        // Wiper values hold across OS sub-samples (zero-order hold).
+        let n = self.norm_smoother.tick();
+        let b = self.bright_smoother.tick();
+        let t = self.tone_smoother.tick();
+        let h_n = self.grid_norm_handle;
+        let h_b = self.grid_bright_handle;
+        let h_t = self.grid_tone_handle;
+        self.v2a_tube.set_pot_position(h_n, n);
+        self.v2a_tube.set_pot_position(h_b, b);
+        self.v2a_tube.set_pot_position(h_t, t);
+    }
+
+    fn process_inner(&mut self, input: f32) -> f32 {
+        let b_plus_preamp = self.amp_topology.b_plus_at(self.preamp_tap);
+
+        // Split host input into per-triode feeds by channel mode.
+        let v1a_input = if self.current_channel_mode != ChannelMode::Bright {
+            input
+        } else {
+            0.0
+        };
+        let v1b_input = if self.current_channel_mode != ChannelMode::Normal {
+            input
+        } else {
+            0.0
+        };
+
+        let v1_out = if self.current_tube_toggle {
+            self.v1_pair_mod
+                .process_pair(v1a_input, v1b_input, b_plus_preamp)
+        } else {
+            self.v1_pair_stock
+                .process_pair(v1a_input, v1b_input, b_plus_preamp)
+        };
+
+        let v2a_out = self
+            .v2a_tube
+            .process_multi(
+                &[v1_out.plate_a_ac_volts, v1_out.plate_b_ac_volts],
+                b_plus_preamp,
+            )
+            .plate_ac_volts;
+
+        let pi_input = self.coupling_v2a.process(v2a_out);
+
+        let ot_volts = self.amp_topology.process_power_section(pi_input);
+
+        // Meter the plates once per host sample (first inner sample only)
+        // — the readout is a ~10ms mean, so oversampled resolution buys
+        // nothing but per-inner-sample overhead.
+        if self.meter_this_host_sample {
+            self.meter_this_host_sample = false;
+            let v1_active = if self.current_tube_toggle {
+                &self.v1_pair_mod
+            } else {
+                &self.v1_pair_stock
+            };
+            self.v1_plate_sum += v1_active.instantaneous_plate_a_volts();
+            self.v2_plate_sum += self.v2a_tube.instantaneous_plate_volts();
+            self.v3v4_plate_sum += self
+                .amp_topology
+                .last_diag()
+                .power_section
+                .power_tube_pos
+                .plate_voltage_volts;
+            self.plate_samples_counted += 1;
+        }
+
+        self.preamp_current_sum += v1_out.plate_a_current_amps
+            + v1_out.plate_b_current_amps
+            + self.v2a_tube.plate_current_amps();
+        self.preamp_current_count += 1;
+
+        ot_volts
+    }
+
+    fn end_buffer(&mut self) {
+        let preamp_mean = if self.preamp_current_count > 0 {
+            self.preamp_current_sum / self.preamp_current_count as f32
+        } else {
+            0.0
+        };
+        self.amp_topology
+            .end_buffer(&[(self.preamp_tap, preamp_mean)]);
+    }
+
+    fn reset(&mut self) {
+        self.v1_pair_stock.reset();
+        self.v1_pair_mod.reset();
+        self.v2a_tube.reset();
+        self.coupling_v2a.reset();
+        self.amp_topology.reset();
+        self.preamp_current_sum = 0.0;
+        self.preamp_current_count = 0;
+        self.meter_this_host_sample = false;
+        self.reset_plate_meters();
+    }
+}
+
+// =============================================================================
+// TweedEngine — runtime-dispatched DspEngine over OS factor
+// =============================================================================
+
+// OS factor is a const-generic-style choice fixed at construction, so this
+// enum picks one `DspEngine<TweedInner, OS>` variant per supported factor.
+// Changing OS factor rebuilds the whole engine (see `initialize()`).
+pub enum TweedEngine {
+    X1(DspEngine<TweedInner, X1Boundary>),
+    X2(DspEngine<TweedInner, X2Boundary>),
+    X4(DspEngine<TweedInner, X4Boundary>),
+    X8(DspEngine<TweedInner, X8Boundary>),
+}
+
+impl TweedEngine {
+    pub fn new(engine_rate: EngineRate, inner: TweedInner) -> Self {
+        match engine_rate.oversampling {
+            OversamplingFactor::X1 => Self::X1(DspEngine::new(
+                engine_rate,
+                X1Boundary::new(engine_rate),
+                inner,
+            )),
+            OversamplingFactor::X2 => Self::X2(DspEngine::new(
+                engine_rate,
+                X2Boundary::new(engine_rate),
+                inner,
+            )),
+            OversamplingFactor::X4 => Self::X4(DspEngine::new(
+                engine_rate,
+                X4Boundary::new(engine_rate),
+                inner,
+            )),
+            OversamplingFactor::X8 => Self::X8(DspEngine::new(
+                engine_rate,
+                X8Boundary::new(engine_rate),
+                inner,
+            )),
+        }
+    }
+
+    #[inline]
+    pub fn engine_rate(&self) -> EngineRate {
+        match self {
+            Self::X1(e) => e.rate(),
+            Self::X2(e) => e.rate(),
+            Self::X4(e) => e.rate(),
+            Self::X8(e) => e.rate(),
+        }
+    }
+
+    #[inline]
+    pub fn begin_buffer(&mut self, n: usize) {
+        match self {
+            Self::X1(e) => e.begin_buffer(n),
+            Self::X2(e) => e.begin_buffer(n),
+            Self::X4(e) => e.begin_buffer(n),
+            Self::X8(e) => e.begin_buffer(n),
+        }
+    }
+
+    #[inline]
+    pub fn process_sample(&mut self, input: f32) -> f32 {
+        match self {
+            Self::X1(e) => e.process_sample(input),
+            Self::X2(e) => e.process_sample(input),
+            Self::X4(e) => e.process_sample(input),
+            Self::X8(e) => e.process_sample(input),
+        }
+    }
+
+    #[inline]
+    pub fn end_buffer(&mut self) {
+        match self {
+            Self::X1(e) => e.end_buffer(),
+            Self::X2(e) => e.end_buffer(),
+            Self::X4(e) => e.end_buffer(),
+            Self::X8(e) => e.end_buffer(),
+        }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        match self {
+            Self::X1(e) => e.reset(),
+            Self::X2(e) => e.reset(),
+            Self::X4(e) => e.reset(),
+            Self::X8(e) => e.reset(),
+        }
+    }
+
+    #[inline]
+    pub fn inner(&self) -> &TweedInner {
+        match self {
+            Self::X1(e) => e.inner(),
+            Self::X2(e) => e.inner(),
+            Self::X4(e) => e.inner(),
+            Self::X8(e) => e.inner(),
+        }
+    }
+
+    #[inline]
+    pub fn inner_mut(&mut self) -> &mut TweedInner {
+        match self {
+            Self::X1(e) => e.inner_mut(),
+            Self::X2(e) => e.inner_mut(),
+            Self::X4(e) => e.inner_mut(),
+            Self::X8(e) => e.inner_mut(),
+        }
+    }
+}
+
+// =============================================================================
+// AudioState — sample-rate / block-size dependent runtime state
+// =============================================================================
+
+// Runtime state whose construction depends on the host's sample rate or
+// max buffer size. Built lazily in `Plugin::initialize`; `None` before then.
+pub struct AudioState {
+    pub engine_rate: EngineRate,
+    pub engine: TweedEngine,
+
+    pub dc_blocker_output: DCBlocker,
+    pub input_meter: InputLevelMeter,
+
+    pub ir_convolver: ir_convolver::HotSwapConvolver,
+    pub pre_ir_buffer: Vec<f32>,
+    pub post_ir_buffer: Vec<f32>,
+    pub ir_block_size: usize,
+    pub ir_crossfade_samples: usize,
+
+    // Always allocated, even in IR mode, so switching cab-modelling modes
+    // is glitch-free and does no allocation on the audio thread.
+    pub cab_processor: SpeakerCabRoomProcessor,
+
+    // Metering window (METER_UPDATE_INTERVAL_MS of host samples): meters
+    // publish to the GUI atomics only when the window closes.
+    pub meter_window_len: usize,
+    pub meter_window_samples: usize,
+    pub meter_output_peak: f32,
+}
+
+impl AudioState {
+    pub(crate) fn build(
+        sample_rate: f32,
+        max_buffer_size: usize,
+        os_factor: OversamplingFactor,
+        params: &TheTweedParams,
+        volume_taper: &PotTaperConfig,
+        input_cal: &InputCalibration,
+        jack_input: &JackInput,
+    ) -> Self {
+        let engine_rate = EngineRate::new(sample_rate, os_factor);
+
+        let v1_pair_stock = build_v1_pair(engine_rate, V1_STOCK_SPEC);
+        let v1_pair_mod = build_v1_pair(engine_rate, V1_MOD_SPEC);
+
+        let amp_topology =
+            AmpTopology::new(engine_rate, build_5e3_amp_topology_config());
+        let preamp_tap = amp_topology.b_plus_tap("preamp");
+        let power_tube_tap = amp_topology.b_plus_tap("power_tube");
+
+        // V1 tube choice sets the plate source-Z baked into the V2A grid
+        // network (~21kΩ 12AY7 vs ~38kΩ 12AX7), which shapes the bright
+        // cap's HF lift.
+        let tube_toggle = params.tube_toggle.value();
+        let v1_spec_name = if tube_toggle { V1_MOD_SPEC } else { V1_STOCK_SPEC };
+        let v1_spec = TubeRegistry::global()
+            .lookup(v1_spec_name)
+            .unwrap_or_else(|| panic!("Tube spec '{}' not found in registry", v1_spec_name));
+        let v1_source_z = plate_source_impedance(v1_spec);
+
+        let mut v2a_tube = build_v2a_tube(engine_rate);
+        let V2aGridNetwork {
+            circuit,
+            norm_volume,
+            bright_volume,
+            tone,
+        } = V2aGridNetwork::new(engine_rate, v1_source_z);
+        v2a_tube.set_grid_circuit(circuit);
+
+        let coupling_v2a = CouplingCapacitor::new(
+            engine_rate,
+            V2A_TO_V2B_COUPLING_CAP_F,
+            V2B_GRID_LEAK_OHMS,
+        );
+
+        let init_norm = volume_taper.wiper_fraction(params.normal_volume.value());
+        let init_bright = volume_taper.wiper_fraction(params.bright_volume.value());
+        let init_tone = params.tone.value();
+
+        // Snap wipers to current settings so the smoother starts at steady state.
+        v2a_tube.set_pot_position(norm_volume, init_norm);
+        v2a_tube.set_pot_position(bright_volume, init_bright);
+        v2a_tube.set_pot_position(tone, init_tone);
+
+        let inner = TweedInner {
+            v1_pair_stock,
+            v1_pair_mod,
+            current_tube_toggle: tube_toggle,
+            v2a_tube,
+            grid_norm_handle: norm_volume,
+            grid_bright_handle: bright_volume,
+            grid_tone_handle: tone,
+            norm_smoother: PotSmoother::new(sample_rate, init_norm, POT_SMOOTH_TAU_S),
+            bright_smoother: PotSmoother::new(sample_rate, init_bright, POT_SMOOTH_TAU_S),
+            tone_smoother: PotSmoother::new(sample_rate, init_tone, POT_SMOOTH_TAU_S),
+            coupling_v2a,
+            amp_topology,
+            preamp_tap,
+            power_tube_tap,
+            current_channel_mode: params.channel_select.value(),
+            preamp_current_sum: 0.0,
+            preamp_current_count: 0,
+            meter_this_host_sample: false,
+            v1_plate_sum: 0.0,
+            v2_plate_sum: 0.0,
+            v3v4_plate_sum: 0.0,
+            plate_samples_counted: 0,
+        };
+        let engine = TweedEngine::new(engine_rate, inner);
+
+        let meter_ceiling = {
+            let inner = engine.inner();
+            let pair = if tube_toggle { &inner.v1_pair_mod } else { &inner.v1_pair_stock };
+            meter_ceiling_for_pair(pair, jack_input)
+        };
+        let input_meter =
+            InputLevelMeter::new(sample_rate, input_cal.input_scale(), meter_ceiling);
+
+        let ir_convolver = ir_convolver::HotSwapConvolver::new(&[1.0], max_buffer_size, 1);
+        let pre_ir_buffer = vec![0.0; max_buffer_size];
+        let post_ir_buffer = vec![0.0; max_buffer_size];
+        let ir_crossfade_samples = (IR_CROSSFADE_MS * sample_rate / 1000.0) as usize;
+
+        let dc_blocker_output = DCBlocker::new(engine_rate, 10.0);
+
+        let cab_processor = build_cab_processor(
+            sample_rate,
+            max_buffer_size,
+            DEFAULT_SPEAKER_ID,
+            DEFAULT_CABINET_ID,
+            params.microphone.value().registry_id(),
+            params.room_selection.value(),
+            MicrophonePlacement {
+                distance_m: params.mic_distance_inches.value() * 0.0254,
+                radial_offset_cm: params
+                    .mic_x_position
+                    .value()
+                    .radial_offset_cm(),
+                off_axis_angle_deg: 0.0,
+            },
+        );
+
+        let meter_window_len =
+            ((METER_UPDATE_INTERVAL_MS * sample_rate / 1000.0) as usize).max(1);
+
+        Self {
+            engine_rate,
+            engine,
+            dc_blocker_output,
+            input_meter,
+            ir_convolver,
+            pre_ir_buffer,
+            post_ir_buffer,
+            ir_block_size: max_buffer_size,
+            ir_crossfade_samples,
+            cab_processor,
+            meter_window_len,
+            meter_window_samples: 0,
+            meter_output_peak: 0.0,
+        }
+    }
+}
+
+// =============================================================================
+// TheTweed — Fender Deluxe 5E3 Plugin
+// =============================================================================
+
+pub struct TheTweed {
+    params: Arc<TheTweedParams>,
+
+    input_cal: InputCalibration,
+    jack_input: JackInput,
+
+    // 5E3 volume pots are 1MΩ Audio 30A taper.
+    volume_taper: PotTaperConfig,
+
+    // Output-transduction boundary: OT secondary volts -> -10dB loadbox
+    // pad -> +24dBu-at-FS converter (IR arm only).
+    loadbox_di: LoadboxDi,
+
+    ir_load_state: Arc<IrLoadState>,
+
+    // Hot-swap slot for the parametric cab chain, populated by the GUI.
+    cab_load_state: Arc<CabProcessorLoadState>,
+
+    // `None` until `Plugin::initialize` runs.
+    audio_state: Option<AudioState>,
+
+    cached_input_trim_db: f32,
+
+    // Latched mic placement, used to detect param changes per-buffer.
+    cached_mic_x_position: MicXPosition,
+    cached_mic_distance_inches: f32,
+
+    meter_peak_volts: Arc<atomic_float::AtomicF32>,
+    meter_bplus_volts: Arc<atomic_float::AtomicF32>,
+    meter_v1_volts: Arc<atomic_float::AtomicF32>,
+    meter_v2_volts: Arc<atomic_float::AtomicF32>,
+    meter_v3v4_volts: Arc<atomic_float::AtomicF32>,
+    meter_output_db: Arc<atomic_float::AtomicF32>,
+    // 0 = not yet initialized; GUI falls back to X4 display.
+    meter_os_ratio: Arc<atomic::AtomicU8>,
 }
 
 impl Default for TheTweed {
     fn default() -> Self {
-        let sample_rate = 48000.0;
-
-        // Build input chain components first — meter needs references to these
-        let input_cal = InputCalibration::amp_standard();
-        let jack_input = JackInput::new(0.0, 1_000_000.0);
-
-        // V1 tubes — build before struct so meter can read ceiling from stock tube
-        let v1a_tube_stock = build_preamp_tube(sample_rate, V1_STOCK_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
-        let v1a_tube_mod = build_preamp_tube(sample_rate, V1_MOD_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
-
-        // Input meter — default tube_toggle=false, so use 12AY7 ceiling
-        let meter_ceiling = meter_ceiling_for_tube(&v1a_tube_stock, &jack_input);
-        let input_meter = InputLevelMeter::new(sample_rate, input_cal.input_scale(), meter_ceiling);
-
-        // Resolve B+ tap handles once at construction — avoids per-sample string
-        // lookups in process(). Refreshed in initialize() when topology rebuilds.
-        let amp_topology = AmpTopology::new(sample_rate, build_5e3_amp_topology_config());
-        let preamp_tap = amp_topology.b_plus_tap("preamp");
-        let power_tube_tap = amp_topology.b_plus_tap("power_tube");
-
         Self {
             params: Arc::new(TheTweedParams::default()),
-            sample_rate,
 
-            input_cal,
-            jack_input,
-            // Output calibration trim — sized so that master=12, all-controls=12
-            // lands at approximately -3 dBFS peak given the 5E3's measured
-            // post-OutputNormalizer signal level and IR convolution gain. Keeps
-            // headroom for intersample peaks and downstream mastering.
-            output_cal: OutputCalibration::with_trim_db(-37.0),
+            input_cal: InputCalibration::amp_standard(),
+            jack_input: JackInput::new(68_000.0, 1_000_000.0),
 
-            // Full MNA model of the 5E3 mixing + tone passive network.
-            mna_normal: {
-                let spec = PassiveNetworkSpec::mixing_5e3_normal(
-                    100_000.0, 1_000_000.0, 68_000.0, 1_000_000.0, 500e-12, 4.7e-9,
-                );
-                MnaSystem::from_netlist(&spec).expect("5E3 normal mixing netlist")
-            },
-            mna_bright: {
-                let spec = PassiveNetworkSpec::mixing_5e3_bright(
-                    100_000.0, 1_000_000.0, 68_000.0, 1_000_000.0, 500e-12, 4.7e-9,
-                );
-                MnaSystem::from_netlist(&spec).expect("5E3 bright mixing netlist")
-            },
-            filter_normal: NthOrderTdfii::new(2, sample_rate),
-            filter_bright: NthOrderTdfii::new(2, sample_rate),
-            mixing_tone_controls: [-1.0; 3],
-
-            // V1A (Normal channel)
-            v1a_tube_stock,
-            v1a_tube_mod,
-            // V1B (Bright channel) — same physical tube, shared cathode
-            v1b_tube_stock: build_preamp_tube(sample_rate, V1_STOCK_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP)),
-            v1b_tube_mod: build_preamp_tube(sample_rate, V1_MOD_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP)),
-            // V2A (gain stage)
-            v2a_tube: build_preamp_tube(sample_rate, V2A_SPEC, V2A_CATHODE_R, Some(V2A_CATHODE_CAP)),
-
-            // Passive coupling caps (V1 plate → volume/mixing, no grid conduction)
-            coupling_v1: CouplingCapacitor::new(sample_rate, 0.1e-6, 1_000_000.0),
-            coupling_v1b: CouplingCapacitor::new(sample_rate, 0.1e-6, 1_000_000.0),
-            // V2A → PI: passive coupling (cathodyne PI grid never conducts — cathode at ~165V)
-            coupling_v2a: CouplingCapacitor::new(sample_rate, 0.02e-6, 1_000_000.0),
-
-            // AmpTopology: PI → power tubes → OT → speaker impedance + power supply
-            // This uses the 5e3 preset in the engine (it is configurable so any topology, within
-            // reason can be passed in).. Smooth. Nice.
-            amp_topology,
-            preamp_tap,
-            power_tube_tap,
-
-            // 5E3 volume pots: 1MΩ CTS 15A audio taper (both channels identical)
             volume_taper: PotTaperConfig::new(PotTaper::Audio30A),
 
-            output_normalizer: {
-                let ot_spec = TransformerRegistry::global()
-                    .lookup(OT_SPEC)
-                    .expect("OT_SPEC must be present in the engine registry");
-                OutputNormalizer::from_spec(ot_spec, POWER_BPLUS_5E3)
-            },
+            loadbox_di: LoadboxDi::standard(),
 
-            ir_convolver: ir_convolver::HotSwapConvolver::new(&[1.0], 512, 1),
             ir_load_state: Arc::new(IrLoadState::new()),
-            pre_ir_buffer: vec![0.0; 512],
-            post_ir_buffer: vec![0.0; 512],
-            ir_block_size: 512,
-            ir_crossfade_samples: (IR_CROSSFADE_MS * 48.0) as usize, // 1440 samples at 48k
 
-            dc_blocker_output: DCBlocker::new(sample_rate, 10.0),
+            cab_load_state: Arc::new(CabProcessorLoadState::new()),
 
-            // Input level meter
-            input_meter,
+            audio_state: None,
+
             cached_input_trim_db: 0.0,
-            cached_tube_toggle: false,
 
-            // Shared meter state (written by audio thread, read by GUI)
+            // Match the param defaults so the first buffer doesn't see a
+            // spurious change-detect and push a no-op mic-placement update.
+            cached_mic_x_position: MicXPosition::CapEdge,
+            cached_mic_distance_inches:4.0,
+
             meter_peak_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
             meter_bplus_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
             meter_v1_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
             meter_v2_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
-            meter_6v6_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
+            meter_v3v4_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
             meter_output_db: Arc::new(atomic_float::AtomicF32::new(-120.0)),
+            // 0 = "not yet initialized"; GUI falls back to X4 display.
+            meter_os_ratio: Arc::new(atomic::AtomicU8::new(0)),
         }
     }
 }
@@ -546,6 +1212,37 @@ impl TheTweed {
                 *p = path.display().to_string();
             }
         }
+    }
+
+    // Public so smoke tests can drive construction without nih-plug's
+    // InitContext. Idempotent — safe to call repeatedly during state restore.
+    pub fn initialize_audio_state(
+        &mut self,
+        sample_rate: f32,
+        max_buffer_size: usize,
+        os_factor: OversamplingFactor,
+    ) {
+        // Trim must be live in `input_cal` before `AudioState::build` reads it.
+        let trim_db = self.params.input_trim_db.value();
+        self.input_cal.set_user_trim_db(trim_db);
+        self.cached_input_trim_db = trim_db;
+
+        let audio_state = AudioState::build(
+            sample_rate,
+            max_buffer_size,
+            os_factor,
+            &self.params,
+            &self.volume_taper,
+            &self.input_cal,
+            &self.jack_input,
+        );
+
+        self.meter_os_ratio.store(
+            audio_state.engine_rate.oversampling.ratio() as u8,
+            atomic::Ordering::Relaxed,
+        );
+
+        self.audio_state = Some(audio_state);
     }
 }
 
@@ -578,76 +1275,38 @@ impl Plugin for TheTweed {
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.sample_rate = buffer_config.sample_rate;
-        self.ir_block_size = buffer_config.max_buffer_size as usize;
+        let sample_rate = buffer_config.sample_rate;
+        let max_buffer_size = buffer_config.max_buffer_size as usize;
 
-        // Resize IR processing buffers to match DAW buffer size
-        self.pre_ir_buffer.resize(self.ir_block_size, 0.0);
-        self.post_ir_buffer.resize(self.ir_block_size, 0.0);
-
-        // Initialize parameter smoothing
         self.params.bright_volume.smoothed.reset(self.params.bright_volume.value());
         self.params.normal_volume.smoothed.reset(self.params.normal_volume.value());
         self.params.tone.smoothed.reset(self.params.tone.value());
         self.params.master.smoothed.reset(self.params.master.value());
 
-        // Rebuild MNA mixing + tone network at new sample rate.
-        {
-            let spec = PassiveNetworkSpec::mixing_5e3_normal(
-                100_000.0, 1_000_000.0, 68_000.0, 1_000_000.0, 500e-12, 4.7e-9,
-            );
-            self.mna_normal = MnaSystem::from_netlist(&spec)
-                .expect("5E3 normal mixing netlist");
-        }
-        {
-            let spec = PassiveNetworkSpec::mixing_5e3_bright(
-                100_000.0, 1_000_000.0, 68_000.0, 1_000_000.0, 500e-12, 4.7e-9,
-            );
-            self.mna_bright = MnaSystem::from_netlist(&spec)
-                .expect("5E3 bright mixing netlist");
-        }
-        self.filter_normal = NthOrderTdfii::new(2, self.sample_rate);
-        self.filter_bright = NthOrderTdfii::new(2, self.sample_rate);
-        self.mixing_tone_controls = [-1.0; 3];
+        let os_factor = self
+            .params
+            .oversampling_factor
+            .lock()
+            .ok()
+            .map(|s| parse_os_factor(&s))
+            .unwrap_or(OversamplingFactor::X4);
 
-        // V1A (Normal)
-        self.v1a_tube_stock = build_preamp_tube(self.sample_rate, V1_STOCK_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
-        self.v1a_tube_mod = build_preamp_tube(self.sample_rate, V1_MOD_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
-        // V1B (Bright) — same physical tube, shared cathode
-        self.v1b_tube_stock = build_preamp_tube(self.sample_rate, V1_STOCK_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
-        self.v1b_tube_mod = build_preamp_tube(self.sample_rate, V1_MOD_SPEC, V1_CATHODE_R, Some(V1_CATHODE_CAP));
-        // V2A (gain stage)
-        self.v2a_tube = build_preamp_tube(self.sample_rate, V2A_SPEC, V2A_CATHODE_R, Some(V2A_CATHODE_CAP));
+        self.initialize_audio_state(sample_rate, max_buffer_size, os_factor);
 
-        // Passive coupling caps (V1 plate → volume/mixing)
-        self.coupling_v1 = CouplingCapacitor::new(self.sample_rate, 0.1e-6, 1_000_000.0);
-        self.coupling_v1b = CouplingCapacitor::new(self.sample_rate, 0.1e-6, 1_000_000.0);
-        // V2A → PI: passive coupling (cathodyne PI grid never conducts)
-        self.coupling_v2a = CouplingCapacitor::new(self.sample_rate, 0.02e-6, 1_000_000.0);
-
-        // Reinitialize AmpTopology (PI → power tubes → OT → impedance + power supply)
-        self.amp_topology = AmpTopology::new(self.sample_rate, build_5e3_amp_topology_config());
-        // Re-resolve B+ tap handles against the fresh topology's power supply.
-        self.preamp_tap = self.amp_topology.b_plus_tap("preamp");
-        self.power_tube_tap = self.amp_topology.b_plus_tap("power_tube");
-        self.output_normalizer = {
-            let ot_spec = TransformerRegistry::global()
-                .lookup(OT_SPEC)
-                .expect("OT_SPEC must be present in the engine registry");
-            OutputNormalizer::from_spec(ot_spec, POWER_BPLUS_5E3)
-        };
-
-        // === IR CONVOLVER REBUILD ===
-        self.ir_convolver = ir_convolver::HotSwapConvolver::new(&[1.0], self.ir_block_size, 1);
-        self.ir_crossfade_samples = (IR_CROSSFADE_MS * self.sample_rate / 1000.0) as usize;
-        self.ir_load_state.set_audio_format(self.sample_rate, self.ir_block_size);
+        self.ir_load_state.set_audio_format(sample_rate, max_buffer_size);
         self.ir_load_state.status.store(ir_load_status::NO_IR, Ordering::Relaxed);
-        // Clear any stale pending convolver left over from a prior lifecycle.
         if let Ok(mut p) = self.ir_load_state.pending.lock() {
             *p = None;
         }
 
-        let persisted_ir_path = self.params.ir_file_path.lock()
+        if let Ok(mut p) = self.cab_load_state.pending.lock() {
+            *p = None;
+        }
+
+        let persisted_ir_path = self
+            .params
+            .ir_file_path
+            .lock()
             .map(|p| p.clone())
             .unwrap_or_default();
         if !persisted_ir_path.is_empty() {
@@ -655,67 +1314,32 @@ impl Plugin for TheTweed {
             if path.exists() {
                 load_ir_file_into_state(&self.ir_load_state, &path);
             } else {
-                self.ir_load_state.status.store(ir_load_status::FAILED, Ordering::Relaxed);
+                self.ir_load_state
+                    .status
+                    .store(ir_load_status::FAILED, Ordering::Relaxed);
             }
         }
-
-        self.dc_blocker_output = DCBlocker::new(self.sample_rate, 10.0);
-
-        // Sync input trim into InputCalibration and rebuild meter
-        let trim_db = self.params.input_trim_db.value();
-        self.input_cal.set_user_trim_db(trim_db);
-        self.cached_input_trim_db = trim_db;
-        let tube_toggle = self.params.tube_toggle.value();
-        self.cached_tube_toggle = tube_toggle;
-        let v1_tube = if tube_toggle { &self.v1a_tube_mod } else { &self.v1a_tube_stock };
-        let ceiling = meter_ceiling_for_tube(v1_tube, &self.jack_input);
-        self.input_meter = InputLevelMeter::new(
-            self.sample_rate,
-            self.input_cal.input_scale(),
-            ceiling,
-        );
 
         true
     }
 
     fn reset(&mut self) {
-        // Reset parameter smoothing
         self.params.bright_volume.smoothed.reset(self.params.bright_volume.value());
         self.params.normal_volume.smoothed.reset(self.params.normal_volume.value());
         self.params.tone.smoothed.reset(self.params.tone.value());
         self.params.master.smoothed.reset(self.params.master.value());
-
-        // Reset input jack
         self.jack_input.reset();
-
-        // Reset MNA mixing + tone filters
-        self.filter_normal.reset();
-        self.filter_bright.reset();
-        self.mixing_tone_controls = [-1.0; 3];
-
-        // Reset preamp tube stages
-        self.v1a_tube_stock.reset();
-        self.v1a_tube_mod.reset();
-        self.v1b_tube_stock.reset();
-        self.v1b_tube_mod.reset();
-        self.v2a_tube.reset();
-
-        // Reset preamp coupling capacitors
-        self.coupling_v1.reset();
-        self.coupling_v1b.reset();
-        self.coupling_v2a.reset();
-
-        // Reset AmpTopology (PI, power tubes, OT, power supply, speaker impedance)
-        self.amp_topology.reset();
-
-        // Reset IR convolver and output
-        self.ir_convolver.reset();
-        self.pre_ir_buffer.fill(0.0);
-        self.post_ir_buffer.fill(0.0);
-        self.dc_blocker_output.reset();
-
-        // Reset input meter
-        self.input_meter.reset();
+        if let Some(audio) = self.audio_state.as_mut() {
+            audio.engine.reset();
+            audio.ir_convolver.reset();
+            audio.cab_processor.reset();
+            audio.pre_ir_buffer.fill(0.0);
+            audio.post_ir_buffer.fill(0.0);
+            audio.dc_blocker_output.reset();
+            audio.input_meter.reset();
+            audio.meter_window_samples = 0;
+            audio.meter_output_peak = 0.0;
+        }
     }
 
     fn process(
@@ -724,225 +1348,180 @@ impl Plugin for TheTweed {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        // Linux hosts (Pipewire, JACK) don't set MXCSR — denormals can
+        // otherwise stall the IIR/oversampler/envelope state.
+        enable_audio_thread_denormal_handling();
+
+        let audio = self
+            .audio_state
+            .as_mut()
+            .expect("Plugin::process called before successful Plugin::initialize");
+
         if let Ok(mut pending) = self.ir_load_state.pending.try_lock() {
             if let Some(new_conv) = pending.take() {
-                self.ir_convolver.queue_swap(new_conv, self.ir_crossfade_samples);
+                audio.ir_convolver.queue_swap(new_conv, audio.ir_crossfade_samples);
             }
         }
 
-        // === V2A VARIABLE GRID LEAK (5E3 Cross-Channel Interaction) ===
-        // In the 5E3, V2A has no dedicated grid leak resistor — the volume pots
-        // serve as grid leak through their wiper-to-ground DC resistance.
-        // Coupling caps block DC, so only the wiper-to-ground path counts.
-        // DC path per channel: 68kΩ mixing R + wiper_frac × 1MΩ pot
-        {
-            let bright_wiper_dc = self.volume_taper.wiper_fraction(self.params.bright_volume.value());
-            let normal_wiper_dc = self.volume_taper.wiper_fraction(self.params.normal_volume.value());
-            let bright_dc_path = 68_000.0 + bright_wiper_dc * 1_000_000.0;
-            let normal_dc_path = 68_000.0 + normal_wiper_dc * 1_000_000.0;
-            let effective_grid_leak = (bright_dc_path * normal_dc_path) / (bright_dc_path + normal_dc_path);
-            // V1 -> volume coupling cap (0.1µF) sets the blocking distortion time constant
-            self.v2a_tube.set_grid_leak(effective_grid_leak, 0.1e-6, self.sample_rate);
-
-            // Charge fraction: at each volume pot wiper, grid current divides between
-            // ground path (R_down = wiper_frac × 1MΩ) and coupling cap path
-            // (R_up = (1-wiper_frac) × 1MΩ + 100kΩ plate load).
-            // cap_frac = R_down / (R_down + R_up) — higher wiper -> more goes to cap
-            const POT_R_DC: f32 = 1_000_000.0;
-            const PLATE_LOAD_DC: f32 = 100_000.0;
-            const MIXING_R_DC: f32 = 68_000.0;
-
-            let normal_cap_frac = {
-                let r_down = normal_wiper_dc * POT_R_DC;
-                let r_up = (1.0 - normal_wiper_dc) * POT_R_DC + PLATE_LOAD_DC;
-                if r_down < 1.0 { 0.0 } else { r_down / (r_down + r_up) }
-            };
-            let bright_cap_frac = {
-                let r_down = bright_wiper_dc * POT_R_DC;
-                let r_up = (1.0 - bright_wiper_dc) * POT_R_DC + PLATE_LOAD_DC;
-                if r_down < 1.0 { 0.0 } else { r_down / (r_down + r_up) }
-            };
-
-            // Grid current splits between the two 68kΩ mixing paths
-            let normal_shunt_dc = MIXING_R_DC + normal_wiper_dc * POT_R_DC;
-            let bright_shunt_dc = MIXING_R_DC + bright_wiper_dc * POT_R_DC;
-            let total_path_z = normal_shunt_dc + bright_shunt_dc;
-            let i_frac_normal = bright_shunt_dc / total_path_z;
-            let i_frac_bright = normal_shunt_dc / total_path_z;
-
-            // Weighted charge fraction — how much of V2A's grid current charges caps
-            let charge_fraction = i_frac_normal * normal_cap_frac
-                                + i_frac_bright * bright_cap_frac;
-            self.v2a_tube.set_charge_fraction(charge_fraction);
+        // try_lock so the audio thread never blocks on a GUI-side build.
+        if let Ok(mut pending) = self.cab_load_state.pending.try_lock() {
+            if let Some(new_processor) = pending.take() {
+                audio.cab_processor = new_processor;
+            }
         }
-
-        // Propagate input jack series resistance to V1 grid current models.
-        let grid_series_r = self.jack_input.source_series_resistance();
-        self.v1a_tube_stock.set_grid_series_resistance(grid_series_r);
-        self.v1a_tube_mod.set_grid_series_resistance(grid_series_r);
-        self.v1b_tube_stock.set_grid_series_resistance(grid_series_r);
-        self.v1b_tube_mod.set_grid_series_resistance(grid_series_r);
 
         let num_samples = buffer.samples();
         let power_on = self.params.power.value();
         let mut sample_idx = 0usize;
 
-        // === INPUT TRIM → InputCalibration ===
         let current_trim_db = self.params.input_trim_db.value();
         if (current_trim_db - self.cached_input_trim_db).abs() > 0.01 {
             self.cached_input_trim_db = current_trim_db;
             self.input_cal.set_user_trim_db(current_trim_db);
-            self.input_meter.set_input_scale(self.input_cal.input_scale());
+            audio.input_meter.set_input_scale(self.input_cal.input_scale());
         }
 
-        // === TUBE TOGGLE → meter ceiling ===
-        let current_tube_toggle = self.params.tube_toggle.value();
-        if current_tube_toggle != self.cached_tube_toggle {
-            self.cached_tube_toggle = current_tube_toggle;
-            let v1_tube = if current_tube_toggle { &self.v1a_tube_mod } else { &self.v1a_tube_stock };
-            self.input_meter.set_clean_ceiling_v(meter_ceiling_for_tube(v1_tube, &self.jack_input));
-        }
-
-        // === MNA MIXING + TONE NETWORK ===
+        let cab_mode = self.params.cab_modelling_mode.value();
+        let mic_x = self.params.mic_x_position.value();
+        let mic_dist_in = self.params.mic_distance_inches.value();
+        if mic_x != self.cached_mic_x_position
+            || (mic_dist_in - self.cached_mic_distance_inches).abs() > 0.001
         {
-            let normal_wiper = self.volume_taper.wiper_fraction(self.params.normal_volume.value()) as f64;
-            let bright_wiper = self.volume_taper.wiper_fraction(self.params.bright_volume.value()) as f64;
-            let tone_raw = self.params.tone.value() as f64;
-            let controls = [normal_wiper, bright_wiper, tone_raw];
-            let controls_changed = controls.iter().zip(self.mixing_tone_controls.iter())
-                .any(|(a, b)| (a - b).abs() > 0.001);
-            if controls_changed {
-                self.mixing_tone_controls = controls;
-                if let Ok(coeffs) = self.mna_normal.compute_coefficients(&controls) {
-                    self.filter_normal.set_analog_coefficients(&coeffs, self.sample_rate);
-                }
-                if let Ok(coeffs) = self.mna_bright.compute_coefficients(&controls) {
-                    self.filter_bright.set_analog_coefficients(&coeffs, self.sample_rate);
-                }
-            }
+            self.cached_mic_x_position = mic_x;
+            self.cached_mic_distance_inches = mic_dist_in;
+            audio.cab_processor.set_mic_placement(MicrophonePlacement {
+                distance_m: mic_dist_in * 0.0254,
+                radial_offset_cm: mic_x.radial_offset_cm(),
+                off_axis_angle_deg: 0.0,
+            });
         }
 
-        // === AmpTopology: begin buffer ===
-        // Routes impedance feedback from previous buffer, prepares power supply interpolation
-        self.amp_topology.begin_buffer(num_samples);
+        // Tube swap changes V1's plate source-Z, so rebuild the V2A grid
+        // network on toggle and snap it to the current pot settings.
+        let current_tube_toggle = self.params.tube_toggle.value();
+        if current_tube_toggle != audio.engine.inner().current_tube_toggle {
+            let v1_spec_name = if current_tube_toggle { V1_MOD_SPEC } else { V1_STOCK_SPEC };
+            let v1_spec = TubeRegistry::global()
+                .lookup(v1_spec_name)
+                .unwrap_or_else(|| panic!("Tube spec '{}' not found in registry", v1_spec_name));
+            let v1_source_z = plate_source_impedance(v1_spec);
+            let V2aGridNetwork {
+                circuit,
+                norm_volume,
+                bright_volume,
+                tone,
+            } = V2aGridNetwork::new(audio.engine_rate, v1_source_z);
 
-        // Circuit-stats accumulators — sampled per-sample inside the loop,
-        // averaged once at end-of-buffer for the GUI modal.
-        let mut v1_plate_sum = 0.0_f32;
-        let mut v2_plate_sum = 0.0_f32;
-        let mut v6v6_plate_sum = 0.0_f32;
-        let mut plate_samples_counted = 0u32;
+            let normal_wiper = self
+                .volume_taper
+                .wiper_fraction(self.params.normal_volume.value());
+            let bright_wiper = self
+                .volume_taper
+                .wiper_fraction(self.params.bright_volume.value());
+            let tone_pos = self.params.tone.value();
 
-        // === PASS 1: Per-sample signal chain ===
+            let inner = audio.engine.inner_mut();
+            inner.v2a_tube.set_grid_circuit(circuit);
+            inner.grid_norm_handle = norm_volume;
+            inner.grid_bright_handle = bright_volume;
+            inner.grid_tone_handle = tone;
+            inner.current_tube_toggle = current_tube_toggle;
+            inner.norm_smoother.set_target(normal_wiper);
+            inner.bright_smoother.set_target(bright_wiper);
+            inner.tone_smoother.set_target(tone_pos);
+            let h_n = inner.grid_norm_handle;
+            let h_b = inner.grid_bright_handle;
+            let h_t = inner.grid_tone_handle;
+            inner.v2a_tube.set_pot_position(h_n, normal_wiper);
+            inner.v2a_tube.set_pot_position(h_b, bright_wiper);
+            inner.v2a_tube.set_pot_position(h_t, tone_pos);
+
+            let ceiling = {
+                let inner = audio.engine.inner();
+                let v1_pair = if current_tube_toggle {
+                    &inner.v1_pair_mod
+                } else {
+                    &inner.v1_pair_stock
+                };
+                meter_ceiling_for_pair(v1_pair, &self.jack_input)
+            };
+            audio.input_meter.set_clean_ceiling_v(ceiling);
+        }
+
+        {
+            let normal_wiper = self
+                .volume_taper
+                .wiper_fraction(self.params.normal_volume.value());
+            let bright_wiper = self
+                .volume_taper
+                .wiper_fraction(self.params.bright_volume.value());
+            let tone_pos = self.params.tone.value();
+            let channel_mode = self.params.channel_select.value();
+            let inner = audio.engine.inner_mut();
+            inner.current_channel_mode = channel_mode;
+            inner.norm_smoother.set_target(normal_wiper);
+            inner.bright_smoother.set_target(bright_wiper);
+            inner.tone_smoother.set_target(tone_pos);
+        }
+
+        audio.engine.begin_buffer(num_samples);
+
+        // Pass 1 — per-sample signal chain.
         for channel_samples in buffer.iter_samples() {
             for sample in channel_samples {
                 if !power_on {
-                    self.pre_ir_buffer[sample_idx] = 0.0;
+                    audio.pre_ir_buffer[sample_idx] = 0.0;
                     sample_idx += 1;
                     continue;
                 }
 
                 let input = *sample;
 
-                // Advance power supply interpolation
-                self.amp_topology.advance_sample();
+                // Meter reads the raw DAW signal, before calibration.
+                audio.input_meter.process(input);
 
-                // === Get control-rate parameters ===
-                // normal_volume / bright_volume / tone are handled once-per-buffer
-                // above (MNA mixing + tone network). channel_select is an enum
-                // param, no smoothing.
-                let channel_mode = self.params.channel_select.value();
+                let conditioned =
+                    self.jack_input.process(self.input_cal.process(input));
 
-                // === INPUT LEVEL METER (raw DAW signal, before calibration) ===
-                self.input_meter.process(input);
+                // Boundary OS: inner DSP fires OS_factor times per host sample.
+                let ot_volts = audio.engine.process_sample(conditioned);
 
-                // === INPUT CALIBRATION (includes user trim via set_user_trim_db) ===
-                let mut signal = self.input_cal.process(input);
-
-                // === INPUT JACK VOLTAGE DIVIDER ===
-                signal = self.jack_input.process(signal);
-
-                // === B+ for preamp (from AmpTopology power supply, physical volts) ===
-                let b_plus_preamp = self.amp_topology.b_plus_at(self.preamp_tap);
-
-                // === DUAL-CHANNEL PREAMP (V1A Normal + V1B Bright) ===
-                // TubeStage::process now owns its cathode-bypass integrator — the
-                // former external CathodeBias shim was deleted in the Phase 3 rewrite.
-                let v1a_input = if channel_mode != ChannelMode::Bright { signal } else { 0.0 };
-                let v1b_input = if channel_mode != ChannelMode::Normal { signal } else { 0.0 };
-
-                // V1A (Normal) — uses B+3 (preamp rail, most filtered)
-                let v1a_out = if self.params.tube_toggle.value() {
-                    self.v1a_tube_mod.process(v1a_input, b_plus_preamp).plate_ac_volts
-                } else {
-                    self.v1a_tube_stock.process(v1a_input, b_plus_preamp).plate_ac_volts
+                // IR mode: loadbox DI converts OT secondary volts to samples.
+                // Dynamic mode: SpeakerCabRoomProcessor's own mic preamp
+                // performs the transduction, so pass raw volts through.
+                audio.pre_ir_buffer[sample_idx] = match cab_mode {
+                    CabModellingMode::Ir => self.loadbox_di.process(ot_volts),
+                    CabModellingMode::Dynamic => ot_volts,
                 };
-                let v1a_coupled = self.coupling_v1.process(v1a_out);
-
-                // V1B (Bright) — uses B+3 (preamp rail, most filtered)
-                let v1b_out = if self.params.tube_toggle.value() {
-                    self.v1b_tube_mod.process(v1b_input, b_plus_preamp).plate_ac_volts
-                } else {
-                    self.v1b_tube_stock.process(v1b_input, b_plus_preamp).plate_ac_volts
-                };
-                let v1b_coupled = self.coupling_v1b.process(v1b_out);
-
-                // === MNA MIXING + TONE NETWORK (filter only; rebuild is per-buffer above) ===
-                signal = self.filter_normal.process(v1a_coupled)
-                       + self.filter_bright.process(v1b_coupled);
-
-                // === V2A Gain Stage — uses B+3 (preamp rail) ===
-                signal = self.v2a_tube.process(signal, b_plus_preamp).plate_ac_volts;
-                signal = self.coupling_v2a.process(signal);
-
-                // === CIRCUIT STATS: sample the active V1A half + V2A plate voltage ===
-                // (B+ and 6V6 plate are read after the power section call below.)
-                let v1a_active = if self.params.tube_toggle.value() {
-                    &self.v1a_tube_mod
-                } else {
-                    &self.v1a_tube_stock
-                };
-                v1_plate_sum += v1a_active.instantaneous_plate_volts();
-                v2_plate_sum += self.v2a_tube.instantaneous_plate_volts();
-
-                // === POWER SECTION (PI → power tubes → OT → speaker impedance) ===
-                // AmpTopology handles: cathodyne PI, PI-to-6V6 coupling, push-pull 6V6,
-                // screen sag, cathode bias, OT (SmallAmerican), speaker impedance EQ,
-                // power supply sag driving.
-                let ot_volts = self.amp_topology.process_power_section(signal);
-
-                // 6V6 plate voltage for the Circuit Stats modal (pos tube of the push-pull pair).
-                v6v6_plate_sum += self.amp_topology
-                    .last_diag()
-                    .power_section
-                    .power_tube_pos
-                    .plate_voltage_volts;
-                plate_samples_counted += 1;
-
-                // === NORMALIZE SPEAKER (physical OT secondary volts → ±1 for IR) ===
-                signal = self.output_normalizer.process(ot_volts);
-
-                // Store pre-IR signal for block convolution
-                self.pre_ir_buffer[sample_idx] = signal;
                 sample_idx += 1;
             }
         }
 
-        // === AmpTopology: end buffer ===
-        // Updates tube load estimates for next buffer's power supply dynamics.
-        // Power tube current is tracked internally per-sample by process_power_section().
-        self.amp_topology.end_buffer(&[]);
+        audio.engine.end_buffer();
 
-        // === PASS 2: Block IR convolution (zero-latency, matched to DAW buffer) ===
-        for i in num_samples..self.ir_block_size {
-            self.pre_ir_buffer[i] = 0.0;
+        // Pass 2 — cab modelling.
+        let ir_block_size = audio.ir_block_size;
+        match cab_mode {
+            CabModellingMode::Ir => {
+                for i in num_samples..ir_block_size {
+                    audio.pre_ir_buffer[i] = 0.0;
+                }
+                audio.ir_convolver.process(
+                    &audio.pre_ir_buffer[..ir_block_size],
+                    &mut audio.post_ir_buffer[..ir_block_size],
+                );
+            }
+            CabModellingMode::Dynamic => {
+                for i in 0..num_samples {
+                    // b_plus_sag: 1.0 (no-op) — sag is already applied upstream.
+                    let (l, r) =
+                        audio.cab_processor.process(audio.pre_ir_buffer[i], 1.0);
+                    audio.post_ir_buffer[i] = 0.5 * (l + r);
+                }
+            }
         }
-        self.ir_convolver.process(
-            &self.pre_ir_buffer[..self.ir_block_size],
-            &mut self.post_ir_buffer[..self.ir_block_size],
-        );
 
-        // === PASS 3: Post-IR processing (output cal, master, DC block) ===
+        // Pass 3 — output trim, master gain, DC block.
         let mut output_peak = 0.0f32;
         {
             let output_channel = &mut buffer.as_slice()[0];
@@ -952,48 +1531,53 @@ impl Plugin for TheTweed {
                     continue;
                 }
 
-                let mut signal = self.post_ir_buffer[i];
+                let mut signal = audio.post_ir_buffer[i];
 
-                // Output calibration
-                signal = self.output_cal.process(signal);
                 let output_trim = self.params.output_trim_db.smoothed.next();
                 signal *= neampmod_engine::db_to_linear(output_trim);
 
-                // Master volume
                 let master = self.params.master.smoothed.next();
                 let master_gain = master.powf(1.5);
                 signal *= master_gain;
 
-                // DC blocking and safety limiting
-                signal = self.dc_blocker_output.process(signal);
+                signal = audio.dc_blocker_output.process(signal);
 
                 output_peak = output_peak.max(signal.abs());
                 output_channel[i] = signal;
             }
         }
 
-        // === METER: snapshot metrics for GUI (once per buffer) ===
-        let metrics = self.input_meter.get_metrics();
-        self.meter_peak_volts.store(metrics.peak_volts, atomic::Ordering::Relaxed);
+        // Publish meters only when the ~10ms window closes; the plate sums
+        // (and output peak) keep accumulating across buffers in between.
+        audio.meter_output_peak = audio.meter_output_peak.max(output_peak);
+        audio.meter_window_samples += num_samples;
+        if audio.meter_window_samples >= audio.meter_window_len {
+            let metrics = audio.input_meter.get_metrics();
+            self.meter_peak_volts.store(metrics.peak_volts, atomic::Ordering::Relaxed);
 
-        // === CIRCUIT STATS: B+ + buffer-mean plate voltages + output dB =========
-        if power_on {
-            let bplus_v = self.amp_topology.b_plus_at(self.power_tube_tap);
-            self.meter_bplus_volts.store(bplus_v, atomic::Ordering::Relaxed);
+            if power_on {
+                let inner = audio.engine.inner();
+                let bplus_v = inner.amp_topology.b_plus_mean_at(inner.power_tube_tap);
+                self.meter_bplus_volts.store(bplus_v, atomic::Ordering::Relaxed);
 
-            if plate_samples_counted > 0 {
-                let n = plate_samples_counted as f32;
-                self.meter_v1_volts.store(v1_plate_sum / n, atomic::Ordering::Relaxed);
-                self.meter_v2_volts.store(v2_plate_sum / n, atomic::Ordering::Relaxed);
-                self.meter_6v6_volts.store(v6v6_plate_sum / n, atomic::Ordering::Relaxed);
+                if inner.plate_samples_counted > 0 {
+                    let n = inner.plate_samples_counted as f32;
+                    self.meter_v1_volts.store(inner.v1_plate_sum / n, atomic::Ordering::Relaxed);
+                    self.meter_v2_volts.store(inner.v2_plate_sum / n, atomic::Ordering::Relaxed);
+                    self.meter_v3v4_volts.store(inner.v3v4_plate_sum / n, atomic::Ordering::Relaxed);
+                }
             }
+            let output_db = if audio.meter_output_peak > 1e-10 {
+                20.0 * audio.meter_output_peak.log10()
+            } else {
+                -120.0
+            };
+            self.meter_output_db.store(output_db, atomic::Ordering::Relaxed);
+
+            audio.engine.inner_mut().reset_plate_meters();
+            audio.meter_window_samples = 0;
+            audio.meter_output_peak = 0.0;
         }
-        let output_db = if output_peak > 1e-10 {
-            20.0 * output_peak.log10()
-        } else {
-            -120.0
-        };
-        self.meter_output_db.store(output_db, atomic::Ordering::Relaxed);
 
         ProcessStatus::Normal
     }
@@ -1005,20 +1589,22 @@ impl Plugin for TheTweed {
 
             let params = self.params.clone();
             let ir_load_state = self.ir_load_state.clone();
+            let cab_load_state = self.cab_load_state.clone();
             let ir_path = self.params.ir_file_path.clone();
             let meter_peak_volts = self.meter_peak_volts.clone();
             let meter_bplus_volts = self.meter_bplus_volts.clone();
             let meter_v1_volts = self.meter_v1_volts.clone();
             let meter_v2_volts = self.meter_v2_volts.clone();
-            let meter_6v6_volts = self.meter_6v6_volts.clone();
+            let meter_v3v4_volts = self.meter_v3v4_volts.clone();
             let meter_output_db = self.meter_output_db.clone();
+            let meter_os_ratio = self.meter_os_ratio.clone();
 
             create_egui_editor(
-                EguiState::from_size(800, 450),
+                EguiState::from_size(800, 520),
                 gui::GuiState::new(
-                    ir_load_state, ir_path, meter_peak_volts,
+                    ir_load_state, cab_load_state, ir_path, meter_peak_volts,
                     meter_bplus_volts, meter_v1_volts, meter_v2_volts,
-                    meter_6v6_volts, meter_output_db,
+                    meter_v3v4_volts, meter_output_db, meter_os_ratio,
                 ),
                 |_, _| {},
                 move |egui_ctx, setter, state| {
@@ -1041,7 +1627,6 @@ impl ClapPlugin for TheTweed {
     const CLAP_FEATURES: &'static [ClapFeature] = &[
         ClapFeature::AudioEffect,
         ClapFeature::Distortion,
-        ClapFeature::Stereo,
         ClapFeature::Mono,
     ];
 }
@@ -1052,8 +1637,5 @@ impl Vst3Plugin for TheTweed {
         &[Vst3SubCategory::Fx, Vst3SubCategory::Distortion];
 }
 
-// Export as CLAP plugin
 nih_export_clap!(TheTweed);
-
-// Export as VST3 plugin
 nih_export_vst3!(TheTweed);

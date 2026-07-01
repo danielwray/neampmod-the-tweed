@@ -1,6 +1,5 @@
 # Rust build artifacts
 /target
-Cargo.lock
 
 # Plugin output directory
 /plugins

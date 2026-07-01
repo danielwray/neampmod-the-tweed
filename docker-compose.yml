@@ -1,8 +1,6 @@
 services:
   build:
     build: .
-    environment:
-      - RUSTFLAGS=-C target-cpu=x86-64-v3
     volumes:
       - .:/workspace
       - ./plugins:/output
