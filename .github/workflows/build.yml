@@ -13,15 +13,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout plugin
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: neampmod-the-tweed
 
       - name: Checkout engine mirror
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: danielwray/neampmod-engine-mirror
           token: ${{ secrets.ENGINE_TOKEN }}
+          persist-credentials: true
           path: neampmod-engine
           ref: 51e840d711ad08f4e4f8a322849831b5dd897ff4 # v4.1.0
 
@@ -83,15 +84,16 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout plugin
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: neampmod-the-tweed
 
       - name: Checkout engine mirror
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: danielwray/neampmod-engine-mirror
           token: ${{ secrets.ENGINE_TOKEN }}
+          persist-credentials: true
           path: neampmod-engine
           ref: 51e840d711ad08f4e4f8a322849831b5dd897ff4 # v4.1.0
 
@@ -143,15 +145,16 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout plugin
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: neampmod-the-tweed
 
       - name: Checkout engine mirror
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: danielwray/neampmod-engine-mirror
           token: ${{ secrets.ENGINE_TOKEN }}
+          persist-credentials: true
           path: neampmod-engine
           ref: 51e840d711ad08f4e4f8a322849831b5dd897ff4 # v4.1.0
 
