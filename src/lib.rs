@@ -16,6 +16,7 @@ use neampmod_engine::{
     InputCalibration,
     InputLevelMeter,
     LoadboxDi,
+    MasterVolume,
     ir_loader,
     ir_convolver,
     PotTaper,
@@ -370,7 +371,7 @@ impl Default for TheTweedParams {
         Self {
             bright_volume: FloatParam::new(
                 "Bright",
-                0.38,
+                0.7,
                 FloatRange::Linear { min: 0.01, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Logarithmic(10.0))
@@ -379,7 +380,7 @@ impl Default for TheTweedParams {
 
             normal_volume: FloatParam::new(
                 "Normal",
-                0.29,
+                0.4,
                 FloatRange::Linear { min: 0.01, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Logarithmic(10.0))
@@ -390,7 +391,7 @@ impl Default for TheTweedParams {
 
             tone: FloatParam::new(
                 "Tone",
-                0.54,
+                0.7,
                 FloatRange::Linear { min: 0.01, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Logarithmic(5.0))
@@ -403,7 +404,7 @@ impl Default for TheTweedParams {
 
             master: FloatParam::new(
                 "Master",
-                0.6,
+                0.7,
                 FloatRange::Linear { min: 0.0001, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Logarithmic(10.0))
@@ -441,7 +442,7 @@ impl Default for TheTweedParams {
 
             mic_distance_inches: FloatParam::new(
                 "Mic Distance",
-                4.0,
+                6.0,
                 FloatRange::Linear { min: 0.1, max: 24.0 },
             )
             .with_unit(" in")
@@ -1113,6 +1114,10 @@ pub struct TheTweed {
     // 5E3 volume pots are 1MΩ Audio 30A taper.
     volume_taper: PotTaperConfig,
 
+    // Post-cab master level. Not part of the 5E3 circuit (a real 5E3 has
+    // no master volume)
+    master_pot: MasterVolume,
+
     // Output-transduction boundary: OT secondary volts -> -10dB loadbox
     // pad -> +24dBu-at-FS converter (IR arm only).
     loadbox_di: LoadboxDi,
@@ -1150,6 +1155,8 @@ impl Default for TheTweed {
             jack_input: JackInput::new(68_000.0, 1_000_000.0),
 
             volume_taper: PotTaperConfig::new(PotTaper::Audio30A),
+
+            master_pot: MasterVolume::power_master(),
 
             loadbox_di: LoadboxDi::standard(),
 
@@ -1511,8 +1518,8 @@ impl Plugin for TheTweed {
                 signal *= neampmod_engine::db_to_linear(output_trim);
 
                 let master = self.params.master.smoothed.next();
-                let master_gain = master.powf(1.5);
-                signal *= master_gain;
+                self.master_pot.set_position(master);
+                signal *= self.master_pot.attenuation();
 
                 signal = audio.dc_blocker_output.process(signal);
 
@@ -1521,8 +1528,7 @@ impl Plugin for TheTweed {
             }
         }
 
-        // Publish meters only when the ~10ms window closes; the plate sums
-        // (and output peak) keep accumulating across buffers in between.
+        // Publish meters
         audio.meter_output_peak = audio.meter_output_peak.max(output_peak);
         audio.meter_window_samples += num_samples;
         if audio.meter_window_samples >= audio.meter_window_len {
@@ -1595,7 +1601,7 @@ impl Plugin for TheTweed {
 
 impl ClapPlugin for TheTweed {
     const CLAP_ID: &'static str = "com.neampmod.the-tweed";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some("Vintage tweed amplifier simulator inspired by classic 1950s circuits.");
+    const CLAP_DESCRIPTION: Option<&'static str> = Some("Physics-based amplifier simulator inspired by the 1957 Fender Tweed Deluxe 5e3 amplifier.");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[
