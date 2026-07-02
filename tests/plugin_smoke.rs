@@ -1,7 +1,7 @@
 //! Plugin construction smoke + V2A-grid rebuild coverage.
 //!
 //! The unit tests under `tests/v1_shared_cathode.rs` and
-//! `tests/v2a_grid_tone_shunt.rs` exercise engine primitives directly
+//! `tests/v2a_grid_network.rs` exercise engine primitives directly
 //! with the values the plugin uses. They do not catch construction-
 //! time bugs in the plugin itself (missing LUT lookups, OT spec
 //! mismatches, AmpTopology config gaps, sample-rate coupling bugs in
@@ -18,8 +18,8 @@
 //! is awkward to construct in tests — that surface is left to
 //! first-DAW-load.
 
-use neampmod_engine::dsp::circuits::mna_circuit::{MnaCircuit, MnaCircuitBuilder, PotHandle, GND};
-use neampmod_engine::{EngineRate, OversamplingFactor, TubeRegistry};
+use neampmod_engine::dsp::circuits::mna_circuit::MnaCircuit;
+use neampmod_engine::{EngineRate, OversamplingFactor};
 use the_tweed::TheTweed;
 
 const SAMPLE_RATE: f32 = 48_000.0;
@@ -74,69 +74,26 @@ fn audio_state_rebuild_is_idempotent() {
     plugin.initialize_audio_state(44_100.0, 256, OversamplingFactor::X8);
 }
 
-/// Reconstructs the V2A-grid MNA with the two V1-tube source impedances
-/// (≈21 kΩ for 12AY7, ≈38 kΩ for 12AX7) and confirms the HF response with
-/// the bright channel active differs measurably. This validates that the
-/// per-toggle rebuild produces meaningful character change rather than
-/// being a redundant operation.
+/// Builds the production V2A-grid MNA with the two V1-tube source
+/// impedances (≈21 kΩ for 12AY7, ≈38 kΩ for 12AX7) and confirms the HF
+/// response with the bright channel active differs measurably. This
+/// validates that the per-toggle rebuild produces meaningful character
+/// change rather than being a redundant operation.
 ///
-/// The network mirrors `V2aGridNetwork::new` element-for-element,
-/// including the tone shunt (rheostat + 5 nF cap) at V2A's grid.
-fn build_mixing_network(v1_source_z_ohms: f32) -> (MnaCircuit, PotHandle, PotHandle) {
-    let v2a_spec = TubeRegistry::global()
-        .lookup("ge_12ax7_100k")
-        .expect("12AX7 spec must be present");
-
+/// Normal volume is held at 0 (its wiper grounded, so the idle Normal
+/// branch presents a fixed 1 MΩ and the changing source-Z affects only
+/// the driven Bright path); bright at 0.5, tone at its 1.0 default so
+/// the 500 pF bypass injection — the most source-Z-sensitive path — is
+/// fully in circuit.
+fn build_mixing_network(v1_source_z_ohms: f32) -> the_tweed::V2aGridNetwork {
     // X1 keeps inner_sr == SAMPLE_RATE so the 8 kHz measurement below
     // stays calibrated to the const defined above.
     let engine_rate = EngineRate::new(SAMPLE_RATE, OversamplingFactor::X1);
-    let mut b = MnaCircuitBuilder::new(engine_rate);
-
-    let (v1a, _) = b.add_driver("v1a_plate");
-    let (v1b, _) = b.add_driver("v1b_plate");
-
-    let v1a_after_src = b.node("v1a_after_src");
-    let norm_pot_top = b.node("norm_pot_top");
-    let norm_wiper = b.node("norm_wiper");
-    let v2a_grid = b.node("v2a_grid");
-
-    b.resistor(v1a, v1a_after_src, v1_source_z_ohms)
-        .capacitor(v1a_after_src, norm_pot_top, 0.1e-6);
-    let (norm_volume, _) = b.pot(norm_pot_top, norm_wiper, GND, 1_000_000.0, 1.0);
-    b.resistor(norm_wiper, v2a_grid, 68_000.0);
-
-    let v1b_after_src = b.node("v1b_after_src");
-    let bright_pot_top = b.node("bright_pot_top");
-    let bright_wiper = b.node("bright_wiper");
-
-    b.resistor(v1b, v1b_after_src, v1_source_z_ohms)
-        .capacitor(v1b_after_src, bright_pot_top, 0.1e-6);
-    let (bright_volume, _) = b.pot(bright_pot_top, bright_wiper, GND, 1_000_000.0, 0.5);
-    // Bright cap across upper pot section — the source-Z-sensitive element.
-    b.capacitor(bright_pot_top, bright_wiper, 500e-12)
-        .resistor(bright_wiper, v2a_grid, 68_000.0);
-
-    // Tone shunt at V2A's grid (same as V2aGridNetwork). Hold at
-    // tone=1.0 (rheostat at full 1 MΩ) so the shunt is mostly
-    // isolated and doesn't dominate the HF measurement.
-    let tone_internal = b.node("tone_internal");
-    let (_tone, _) = b.pot(tone_internal, tone_internal, v2a_grid, 1_000_000.0, 1.0);
-    b.capacitor(tone_internal, GND, 5e-9);
-
-    use neampmod_engine::dsp::circuits::mna_circuit::{GridBiasType, GridConductionConfig};
-    b.grid_conduction(
-        v2a_grid,
-        GridConductionConfig {
-            grid_perveance: v2a_spec.grid_perveance,
-            contact_potential: v2a_spec.threshold.abs(),
-            bias_type: GridBiasType::CathodeBias {
-                cathode_voltage: -v2a_spec.bias_voltage,
-            },
-        },
-    );
-    b.set_output(v2a_grid);
-
-    (b.build().expect("network must build"), norm_volume, bright_volume)
+    let mut net = the_tweed::V2aGridNetwork::new(engine_rate, v1_source_z_ohms);
+    net.circuit.set_pot_position(net.norm_volume, 0.0);
+    net.circuit.set_pot_position(net.bright_volume, 0.5);
+    net.circuit.set_pot_position(net.tone, 1.0);
+    net
 }
 
 fn measure_hf_rms(circuit: &mut MnaCircuit, freq_hz: f32, amp: f32, settle: usize, measure: usize) -> f32 {
@@ -156,25 +113,24 @@ fn measure_hf_rms(circuit: &mut MnaCircuit, freq_hz: f32, amp: f32, settle: usiz
     (sum_sq / measure as f32).sqrt()
 }
 
-/// At 8 kHz with the bright channel volume mid-position, the 500 pF bright
-/// cap couples HF directly to the wiper. The HF divider — V1 plate
-/// source-Z in series with the path to V2A's grid — gives the 12AY7
-/// (≈21 kΩ source-Z) a slight edge over the 12AX7 (≈38 kΩ). The
-/// difference is smaller than back-of-envelope suggests because the
-/// bright cap's low reactance at HF dilutes the source-Z effect, but it
-/// is reliably present and verifies the toggle rebuild is not a no-op.
+/// At 8 kHz with the bright channel volume mid-position and tone up, the
+/// 500 pF bypass couples HF from the Bright channel's pre-volume node
+/// into the grid junction. The HF divider — V1 plate source-Z in series
+/// with that path — gives the 12AY7 (≈21 kΩ source-Z) a measurable edge
+/// over the 12AX7 (≈38 kΩ), which verifies the toggle rebuild is not a
+/// no-op.
 #[test]
 fn v1_source_z_affects_hf_bright_response() {
-    let (mut circuit_ay7, _, _) = build_mixing_network(21_000.0);
-    let (mut circuit_ax7, _, _) = build_mixing_network(38_500.0);
+    let mut net_ay7 = build_mixing_network(21_000.0);
+    let mut net_ax7 = build_mixing_network(38_500.0);
 
     // Long settle (1 s) so any cap charging is past.
     let settle = SAMPLE_RATE as usize;
     let measure = (SAMPLE_RATE / 100.0) as usize; // 10 ms
 
     let amp = 1.0_f32;
-    let rms_ay7 = measure_hf_rms(&mut circuit_ay7, 8_000.0, amp, settle, measure);
-    let rms_ax7 = measure_hf_rms(&mut circuit_ax7, 8_000.0, amp, settle, measure);
+    let rms_ay7 = measure_hf_rms(&mut net_ay7.circuit, 8_000.0, amp, settle, measure);
+    let rms_ax7 = measure_hf_rms(&mut net_ax7.circuit, 8_000.0, amp, settle, measure);
 
     // 12AY7 should produce a measurably larger HF level than 12AX7 at
     // V2A's grid. The bright cap dilutes the source-Z effect, but the

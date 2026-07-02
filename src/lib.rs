@@ -566,9 +566,10 @@ fn build_v1_pair(
     pair
 }
 
-// V2A's grid network (V1 mixing + bright cap + tone shunt + grid
-// conduction) is attached separately via `set_grid_circuit` — see
-// `V2aGridNetwork` below. V2A→V2B is a plain 0.02µF/1MΩ coupling cap.
+// V2A's grid network (backwards-wired volume pots + bright-cap treble
+// bypass + 3-terminal tone pot + grid conduction) is attached separately
+// via `set_grid_circuit` — see `V2aGridNetwork` below. V2A→V2B is a
+// plain 0.02µF/1MΩ coupling cap.
 fn build_v2a_tube(engine_rate: EngineRate) -> TubeStage {
     build_preamp_tube(
         engine_rate,
@@ -585,33 +586,22 @@ fn plate_source_impedance(spec: &TubeSpec) -> f32 {
     rp * rl / (rp + rl)
 }
 
-// Passive subcircuit between the V1 plates and V2A's grid: each V1 plate
-// feeds a 0.1µF coupling cap into a 1MΩ volume pot (500pF bright cap
-// across the Bright pot's upper half), and both wipers join through 68kΩ
-// mixing resistors at V2A's grid. Tone is a shunt-to-ground rheostat at
-// that same grid node — 1MΩ pot in series with a 5nF cap to ground (the
-// pot's `top` and `wiper` tie to the same node to make a 2-terminal
-// rheostat from the 3-terminal primitive). Grid conduction is stamped at
-// V2A's grid; the volume pots double as its DC grid leak.
-//
-// Driver order is load-bearing: handle 0 is V1A plate, handle 1 is V1B
-// plate — must match the `process_multi(&[v1a, v1b], ...)` call site.
-struct V2aGridNetwork {
-    circuit: MnaCircuit,
-    norm_volume: PotHandle,
-    bright_volume: PotHandle,
-    tone: PotHandle,
+// Passive subcircuit between the V1 plates and V2A's grid
+pub struct V2aGridNetwork {
+    pub circuit: MnaCircuit,
+    pub norm_volume: PotHandle,
+    pub bright_volume: PotHandle,
+    pub tone: PotHandle,
 }
 
 impl V2aGridNetwork {
-    const COUPLING_CAP_F: f32 = 0.1e-6;
-    const VOLUME_POT_OHMS: f32 = 1_000_000.0;
-    const BRIGHT_CAP_F: f32 = 500e-12;
-    const MIXING_R_OHMS: f32 = 68_000.0;
-    const TONE_POT_OHMS: f32 = 1_000_000.0;
-    const TONE_CAP_F: f32 = 5e-9;
+    pub const COUPLING_CAP_F: f32 = 0.1e-6;
+    pub const VOLUME_POT_OHMS: f32 = 1_000_000.0;
+    pub const BRIGHT_CAP_F: f32 = 500e-12;
+    pub const TONE_POT_OHMS: f32 = 1_000_000.0;
+    pub const TONE_CAP_F: f32 = 5e-9;
 
-    fn new(engine_rate: EngineRate, v1_source_z_ohms: f32) -> Self {
+    pub fn new(engine_rate: EngineRate, v1_source_z_ohms: f32) -> Self {
         let v2a_spec = TubeRegistry::global()
             .lookup(V2A_SPEC)
             .unwrap_or_else(|| panic!("Tube spec '{}' not found in registry", V2A_SPEC));
@@ -621,39 +611,34 @@ impl V2aGridNetwork {
         let (v1a, _drv_v1a) = b.add_driver("v1a_plate");
         let (v1b, _drv_v1b) = b.add_driver("v1b_plate");
 
-        let v1a_after_src = b.node("v1a_after_src");
-        let norm_pot_top = b.node("norm_pot_top");
-        let norm_wiper = b.node("norm_wiper");
         let v2a_grid = b.node("v2a_grid");
+
+        let v1a_after_src = b.node("v1a_after_src");
+        let norm_in = b.node("norm_in");
         b.resistor(v1a, v1a_after_src, v1_source_z_ohms)
-            .capacitor(v1a_after_src, norm_pot_top, Self::COUPLING_CAP_F);
+            .capacitor(v1a_after_src, norm_in, Self::COUPLING_CAP_F);
         let (norm_volume, _) =
-            b.pot(norm_pot_top, norm_wiper, GND, Self::VOLUME_POT_OHMS, 1.0);
-        b.resistor(norm_wiper, v2a_grid, Self::MIXING_R_OHMS);
+            b.pot(v2a_grid, norm_in, GND, Self::VOLUME_POT_OHMS, 1.0);
 
         let v1b_after_src = b.node("v1b_after_src");
-        let bright_pot_top = b.node("bright_pot_top");
-        let bright_wiper = b.node("bright_wiper");
+        let bright_in = b.node("bright_in");
         b.resistor(v1b, v1b_after_src, v1_source_z_ohms)
-            .capacitor(v1b_after_src, bright_pot_top, Self::COUPLING_CAP_F);
+            .capacitor(v1b_after_src, bright_in, Self::COUPLING_CAP_F);
         let (bright_volume, _) =
-            b.pot(bright_pot_top, bright_wiper, GND, Self::VOLUME_POT_OHMS, 0.0);
-        b.capacitor(bright_pot_top, bright_wiper, Self::BRIGHT_CAP_F)
-            .resistor(bright_wiper, v2a_grid, Self::MIXING_R_OHMS);
+            b.pot(v2a_grid, bright_in, GND, Self::VOLUME_POT_OHMS, 0.0);
 
-        let tone_internal = b.node("tone_internal");
+        let tone_top = b.node("tone_top");
+        let tone_bottom = b.node("tone_bottom");
+        b.capacitor(bright_in, tone_top, Self::BRIGHT_CAP_F);
         let (tone, _) = b.pot(
-            tone_internal,
-            tone_internal,
+            tone_top,
             v2a_grid,
+            tone_bottom,
             Self::TONE_POT_OHMS,
             1.0,
         );
-        b.capacitor(tone_internal, GND, Self::TONE_CAP_F);
+        b.capacitor(tone_bottom, GND, Self::TONE_CAP_F);
 
-        // V2A's reflected Miller capacitance at the grid node forms the
-        // 5E3's interactive-volume treble pole against the mixer's
-        // pot-position-dependent source impedance.
         b.capacitor(v2a_grid, GND, v2a_spec.miller_c_eff_farads());
 
         b.grid_conduction(
@@ -716,14 +701,9 @@ pub struct TweedInner {
 
     pub current_channel_mode: ChannelMode,
 
-    // Per-buffer accumulators for PSU drain, drained in `end_buffer`.
-    // Part of the physics (power-supply loading) — never decimated.
     pub preamp_current_sum: f32,
     pub preamp_current_count: u32,
 
-    // GUI-only metering: plate voltages sampled once per host sample
-    // (not per inner/oversampled sample) and accumulated across buffers
-    // until the plugin drains them at the METER_UPDATE_INTERVAL_MS cadence.
     pub meter_this_host_sample: bool,
     pub v1_plate_sum: f32,
     pub v2_plate_sum: f32,
@@ -800,9 +780,7 @@ impl InnerDspProcessor for TweedInner {
 
         let ot_volts = self.amp_topology.process_power_section(pi_input);
 
-        // Meter the plates once per host sample (first inner sample only)
-        // — the readout is a ~10ms mean, so oversampled resolution buys
-        // nothing but per-inner-sample overhead.
+        // Meter the plates
         if self.meter_this_host_sample {
             self.meter_this_host_sample = false;
             let v1_active = if self.current_tube_toggle {
@@ -982,12 +960,8 @@ pub struct AudioState {
     pub ir_block_size: usize,
     pub ir_crossfade_samples: usize,
 
-    // Always allocated, even in IR mode, so switching cab-modelling modes
-    // is glitch-free and does no allocation on the audio thread.
     pub cab_processor: SpeakerCabRoomProcessor,
 
-    // Metering window (METER_UPDATE_INTERVAL_MS of host samples): meters
-    // publish to the GUI atomics only when the window closes.
     pub meter_window_len: usize,
     pub meter_window_samples: usize,
     pub meter_output_peak: f32,
