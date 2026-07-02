@@ -1,3 +1,9 @@
 # CI related things... Only the follow MLUT files will be included from the engine.
 [env]
-NEAMPMOD_TUBES = "ge_12ay7_100k,rca_12ax7a_100k,ge_12ax7_cathodyne_56k,rca_6v6gta_5e3,5y3"
+NEAMPMOD_TUBES = "ge_12ay7_100k,ge_12ax7_100k,ge_12ax7_cathodyne_56k,ge_6v6gt_5e3,ge_5y3"
+NEAMPMOD_SPEAKERS = "jensen_p12r"
+NEAMPMOD_CABINETS = "fender_5e3_open_back_1x12"
+
+# x86-64 baseline: https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
