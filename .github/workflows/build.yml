@@ -24,7 +24,6 @@ jobs:
           token: ${{ secrets.ENGINE_TOKEN }}
           persist-credentials: true
           path: neampmod-engine
-          ref: 51e840d711ad08f4e4f8a322849831b5dd897ff4 # v4.1.0
           fetch-depth: 0
 
       - name: Install Rust 1.92
@@ -96,7 +95,6 @@ jobs:
           token: ${{ secrets.ENGINE_TOKEN }}
           persist-credentials: true
           path: neampmod-engine
-          ref: 51e840d711ad08f4e4f8a322849831b5dd897ff4 # v4.1.0
           fetch-depth: 0
 
       - name: Install Rust 1.92
@@ -158,7 +156,6 @@ jobs:
           token: ${{ secrets.ENGINE_TOKEN }}
           persist-credentials: true
           path: neampmod-engine
-          ref: 51e840d711ad08f4e4f8a322849831b5dd897ff4 # v4.1.0
           fetch-depth: 0
 
       - name: Install Rust 1.92
