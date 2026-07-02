@@ -24,7 +24,6 @@ jobs:
           token: ${{ secrets.ENGINE_TOKEN }}
           persist-credentials: true
           path: neampmod-engine
-          fetch-depth: 0
 
       - name: Install Rust 1.92
         uses: dtolnay/rust-toolchain@master
@@ -95,7 +94,6 @@ jobs:
           token: ${{ secrets.ENGINE_TOKEN }}
           persist-credentials: true
           path: neampmod-engine
-          fetch-depth: 0
 
       - name: Install Rust 1.92
         uses: dtolnay/rust-toolchain@master
@@ -156,7 +154,6 @@ jobs:
           token: ${{ secrets.ENGINE_TOKEN }}
           persist-credentials: true
           path: neampmod-engine
-          fetch-depth: 0
 
       - name: Install Rust 1.92
         uses: dtolnay/rust-toolchain@master
