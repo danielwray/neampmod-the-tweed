@@ -1,16 +1,11 @@
 # NEAMPMOD The Tweed
 
-The Tweed is a circuit-level simulation inspired by the 1957 Fender® 5E3 Deluxe amplifier.
+The Tweed is a circuit-level simulation based upon the 1957 Fender® 5E3 Deluxe amplifier.
 
-* The `stock` v1a/b preamp tube is a General Electric 12AY7 100k (spline)
-* The `mod` v1a/b preamp tube is a RCA 12AX7 100k (spline)
-* The v2a voltage gain tube is a RCA 12AX7 tube 100k (spline)
-* The phaser inverter stage uses a General Electric 12AX7 56k tube (spline)
-* The v3/v4 power amp stage uses a RCA 6V6GT tube + 5e3 configuration (spline)
-* The v5 rectifier stage uses a Generic 5Y3 (Koren)
-  * Koren fitting based off of General Electric 5Y3 documentation
-* Speaker impedence modelling assumes a Jensen® P12R speaker.
-  * The plugin no longer ships with a default IR file, please see `Using the Plugin` section.
+The Tweed uses the `neampmod-engine`, a physics-based white box modelling engine, to power it's amp and cabinet
+DSP.
+
+---
 
 <div style="text-align: center;">
     <img width="50%" src="img/amp.png">
@@ -58,25 +53,13 @@ The `Selected:` and `Will apply on next plugin reload` hints in the modal disapp
 |-----------------------|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 |Channel Toggle         |`N`, `J`, `B`    |Toggles between two available channels, or jumpers channels. Volume controls are always active and interactive even if not jumpered, and/ or the channel is not active. |
 |Power Toggle           |`On`, `Off`      |Turns the amp DSP `on`/ `off` - Note the plugin does not passthru signal when `off`. |
-|Tone                   |1-12             |Controls the tone; This has a large impact on drive. |
+|Tone                   |1-12             |Controls the tone; This also has a large impact on drive. |
 |Bright Channel Volume  |1-12             |Drives `v1b` and has `500 pF` bright cap; Channel has more drive and treble than `Normal` channel. |
 |Normal Channel Volume  |1-12             |Drives `v1a` and is warmer/ thicker than the `Bright` channel. |
-|AY/AX Toggle           |`AY`, `AX`       |Swaps V1A and V1B between a `12AY7` (stock) and `12AX7` (higher-mu mod). The `12AX7` gives earlier, more aggressive breakup and a stiffer bright-cap HF lift. Triggers a control-rate rebuild of the V2A grid network. |
-|Master Knob            |1-12             |Linear fine-tuning volume control at end of circuit after IR, this does not impact gain / tone. |
+|AY/AX Toggle           |`AY`, `AX`       |Swaps V1A and V1B between a `12AY7` (stock) and `12AX7` (higher-mu mod). The `12AX7` gives earlier, more aggressive breakup and a stiffer bright-cap HF lift. |
+|Master Knob            |1-12             |Tapered 30A control at end of circuit after IR / Cab, this does not impact gain / tone. |
 
-### IR vs Dynamic Modelling
-
-Impulse response or dynamic (cabinet, speaker, mic, and room) modelling options are selectable from the `Settings` modal.
-
-#### Dynamic Cabinet
-
-Dynamic cabinet models the Fender Tweed Deluxe 5E3 cabinet, a Jensen P12R 12" speaker, a range of selectable microphones along with exposing options to set the following:
-
-* Mic X         = ```[Cap, Cap Edge, Cone, Cone Edge]```
-* Mic Distance  = ```0.1" - 24"```
-* Room          = ```[None, Small studio, Large Studio, Live Room, Small Bedroom, Wooden Barn, ISO Box]```
-
-#### IR Load (Browse Button)
+### IR Load (Browse Button)
 
 Opens an OS-native file window, navigate to your IR WAV file and load it.
 
@@ -90,8 +73,6 @@ Two sliders at the bottom of the plugin window:
 
 * **Input Trim** - `−18 dB` to `+12 dB`, `0.1 dB` step. Applied to the DAW signal before the amp's input calibration / jack model. Use it to bring the `Signal` meter into the expected range for your pickup type (see `Gain Setup`).
 * **Output Trim** - `−24 dB` to `0 dB`, `0.1 dB` step. Post-IR, pre-master. Use it to bring the plugin's output to a workable mix level without changing amp gain structure.
-
-Both trims are smoothed over ~5 ms so automation does not click.
 
 ### Signal Meter (zones)
 
@@ -116,9 +97,11 @@ The `Settings` button at the bottom-right of the window opens a modal with the o
 
 ## Using the Plugin
 
-The Tweed is available in VST3 and CLAP plugin formats for Linux and Windows.
+The Tweed is available in VST3 and CLAP plugin formats for Linux, Windows and MacOS Universal Binaries.
 
-To install the plugins copy the `.vst3` to your VST3 directory, and likewise to your `.clap` directory for
+WARNING: I am not able to test the Windows or MacOS artifacts; Please raise an issue if you have problems.
+
+To install the plugins copy the `.vst3` artifact(s0) to your VST3 directory, and likewise to your `.clap` directory for
 the CLAP plugin.
 
 The plugin does not ship with a default IR file - you must load your own. The following sources provide excellent impulse response files:
@@ -153,6 +136,9 @@ Expected voltage ranges by pickup type:
 Where the signal lands on the meter determines where `V1A` operates on its transfer curve - too high and the amp
 will behave as if a boost pedal is already in the chain; too low and you will lose the touch sensitivity that emerges 
 near the operating point.
+
+With my DI I have to enable the PAD button, which drops the signal level by around -20dB, I then adjust the preamp gain to boost the signal 
+back up to around -12dB in my DAW and leave the input trim on the plugin at 0dB.
 
 ## System Requirements
 
@@ -196,6 +182,7 @@ This code is released under the [GNU GPLv3 license](LICENSE).
 
 The binaries (VST3, CLAP) are released under a [GNU GPLv3 license](LICENSE).
 
-* Fender® is a registrated trademark of Fender Musical Instruments Corporation.
+* Fender® is a registered trademark of Fender Musical Instruments Corporation.
+* Jensen® is a registered trademark of SICA Altoparlanti. 
 * VST® is a registered trademark of Steinberg Media Technologies GmbH.
 
