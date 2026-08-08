@@ -5,9 +5,13 @@ use std::sync::atomic::Ordering;
 #[cfg(feature = "gui")]
 mod gui;
 
-use neampmod_engine::{
+use thermionicdsp::{
+    specimen_physics,
+    BiasSpec,
+    LoadLineConfig,
+    LoadLineTopology,
     TubeStage,
-    TubeRegistry,
+    TubeStageConfig,
     AmpTopology,
     AmpTopologyConfig,
     BPlusTap,
@@ -36,10 +40,10 @@ use neampmod_engine::{
     SpeakerWiring,
     MicrophonePlacement,
 };
-use neampmod_engine::dsp::amps::tube_modeling::{
-    SharedCathodeTriodePair, SharedCathodeTriodePairConfig, TubeSpec,
+use thermionicdsp::dsp::amps::tube_modeling::{
+    SharedCathodeTriodePair, SharedCathodeTriodePairConfig,
 };
-use neampmod_engine::dsp::circuits::mna_circuit::{
+use thermionicdsp::dsp::circuits::mna_circuit::{
     GridBiasType, GridConductionConfig, MnaCircuit, MnaCircuitBuilder, PotHandle,
     PotSmoother, GND,
 };
@@ -508,9 +512,10 @@ fn build_5e3_amp_topology_config() -> AmpTopologyConfig {
 
 const PREAMP_BPLUS_5E3: f32 = 250.0;
 
-const V1_STOCK_SPEC: &str = "ge_12ay7_100k";
-const V1_MOD_SPEC: &str = "ge_12ax7_100k";
-const V2A_SPEC: &str = "ge_12ax7_100k";
+// Atomic specimen ids — MLUTs generate at construction and memoise process-wide.
+const V1_STOCK_SPECIMEN: &str = "ge_12ay7";
+const V1_MOD_SPECIMEN: &str = "ge_12ax7";
+const V2A_SPECIMEN: &str = "ge_12ax7";
 const RECTIFIER_SPEC: &str = "ge_5y3";
 const OT_SPEC: &str = "sst_108";
 const V1_CATHODE_R: f32 = 820.0;
@@ -520,24 +525,47 @@ const V2A_CATHODE_CAP: f32 = 25.0;
 const V2A_TO_V2B_COUPLING_CAP_F: f32 = 0.02e-6;
 const V2B_GRID_LEAK_OHMS: f32 = 1_000_000.0;
 
+// 5E3 preamp plate load — 100 kΩ on both V1 triodes and V2A per the print.
+const PREAMP_PLATE_R_OHMS: f32 = 100_000.0;
+// Quiescent V_gk at the 100 kΩ / 330 V generation operating point.
+const V1_STOCK_BIAS_V: f64 = -1.5; // 12AY7
+const V1_MOD_BIAS_V: f64 = -1.2; // 12AX7
+const V2A_BIAS_V: f64 = -1.2; // 12AX7
+
 const POT_SMOOTH_TAU_S: f32 = 0.020;
+
+/// 5E3 preamp-triode load line: 100 kΩ plate load, 330 V LUT reference B+.
+/// `cathode_resistor_ohms` stays 0.0 — cathode degeneration is modelled at
+/// runtime from each stage's own Rk‖Ck config; baking it into the LUT would
+/// double-count it.
+fn preamp_load_line(reference_bias: f64) -> LoadLineConfig {
+    LoadLineConfig {
+        topology: LoadLineTopology::Triode {
+            plate_operating_points: vec![
+                1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.71, 0.67,
+                0.63, 0.59, 0.55, 0.51, 0.47, 0.43, 0.39, 0.35,
+            ],
+        },
+        plate_resistor_ohms: PREAMP_PLATE_R_OHMS as f64,
+        cathode_resistor_ohms: 0.0,
+        reference_bplus: 330.0,
+        reference_bias: BiasSpec::Authored(reference_bias),
+    }
+}
 
 fn build_preamp_tube(
     engine_rate: EngineRate,
-    spec_name: &str,
+    specimen_id: &str,
+    load_line: &LoadLineConfig,
     cathode_resistor_ohms: f32,
     cathode_bypass_cap_uf: Option<f32>,
 ) -> TubeStage {
-    let reg = TubeRegistry::global();
-    let spec = reg.lookup(spec_name)
-        .unwrap_or_else(|| panic!("Tube spec '{}' not found in registry", spec_name));
-    let mut stage = TubeStage::from_spec(
-        engine_rate,
-        spec,
-        cathode_resistor_ohms,
-        cathode_bypass_cap_uf,
-    )
-    .unwrap_or_else(|e| panic!("Failed to build tube from spec '{}': {}", spec_name, e));
+    let config = TubeStageConfig::default()
+        .with_cathode_circuit(cathode_resistor_ohms, cathode_bypass_cap_uf);
+    let mut stage = TubeStage::from_specimen_id(engine_rate, specimen_id, load_line, config)
+        .unwrap_or_else(|e| {
+            panic!("Failed to build tube from specimen '{}': {}", specimen_id, e)
+        });
     stage.set_plate_bplus_voltage(PREAMP_BPLUS_5E3);
     stage
 }
@@ -548,43 +576,52 @@ fn build_preamp_tube(
 // ducking — a hard drive into one grid biases both triodes toward cutoff.
 fn build_v1_pair(
     engine_rate: EngineRate,
-    spec_name: &str,
+    specimen_id: &str,
+    reference_bias: f64,
 ) -> SharedCathodeTriodePair {
     let config = SharedCathodeTriodePairConfig {
-        tube_spec: spec_name.into(),
         shared_cathode_resistor_ohms: V1_CATHODE_R,
         shared_cathode_bypass_cap_uf: Some(V1_CATHODE_CAP),
         shared_cathode_bypass_dielectric: Some("electrolytic_vintage".into()),
-        plate_resistor_a_ohms: 100_000.0,
-        plate_resistor_b_ohms: 100_000.0,
+        plate_resistor_a_ohms: PREAMP_PLATE_R_OHMS,
+        plate_resistor_b_ohms: PREAMP_PLATE_R_OHMS,
         tube_mismatch: Some(0.05),
         linear_blend_threshold: None,
         plate_voltage_fraction: 1.0,
     };
-    let mut pair = SharedCathodeTriodePair::from_config(engine_rate, config)
-        .unwrap_or_else(|e| panic!("V1 pair build for '{}': {}", spec_name, e));
+    let mut pair = SharedCathodeTriodePair::from_specimen_id(
+        engine_rate,
+        specimen_id,
+        &preamp_load_line(reference_bias),
+        config,
+    )
+    .unwrap_or_else(|e| panic!("V1 pair build for '{}': {}", specimen_id, e));
     pair.set_plate_bplus_voltage(PREAMP_BPLUS_5E3);
     pair
 }
 
 // V2A's grid network (backwards-wired volume pots + bright-cap treble
-// bypass + 3-terminal tone pot + grid conduction) is attached separately
-// via `set_grid_circuit` — see `V2aGridNetwork` below. V2A→V2B is a
+// bypass + 3-terminal tone pot + grid conduction) is solved standalone and
+// its output fed to this stage — see `V2aGridNetwork` below. V2A→V2B is a
 // plain 0.02µF/1MΩ coupling cap.
 fn build_v2a_tube(engine_rate: EngineRate) -> TubeStage {
     build_preamp_tube(
         engine_rate,
-        V2A_SPEC,
+        V2A_SPECIMEN,
+        &preamp_load_line(V2A_BIAS_V),
         V2A_CATHODE_R,
         Some(V2A_CATHODE_CAP),
     )
 }
 
-// Tube-plate Thévenin source impedance: R_load ∥ r_p.
-fn plate_source_impedance(spec: &TubeSpec) -> f32 {
-    let rp = spec.rp;
-    let rl = spec.plate_resistor_ohms;
-    rp * rl / (rp + rl)
+// Tube-plate Thévenin source impedance: R_load ∥ r_p — r_p from the atomic
+// specimen (datasheet typical operation), plate load from the 5E3 print.
+fn plate_source_impedance(specimen_id: &str) -> f32 {
+    let rp = specimen_physics(specimen_id)
+        .unwrap_or_else(|e| panic!("V1 specimen '{}': {}", specimen_id, e))
+        .rp
+        .unwrap_or_else(|| panic!("V1 specimen '{}' cites no [circuit].rp", specimen_id));
+    rp * PREAMP_PLATE_R_OHMS / (rp + PREAMP_PLATE_R_OHMS)
 }
 
 // Passive subcircuit between the V1 plates and V2A's grid
@@ -602,10 +639,17 @@ impl V2aGridNetwork {
     pub const TONE_POT_OHMS: f32 = 1_000_000.0;
     pub const TONE_CAP_F: f32 = 5e-9;
 
-    pub fn new(engine_rate: EngineRate, v1_source_z_ohms: f32) -> Self {
-        let v2a_spec = TubeRegistry::global()
-            .lookup(V2A_SPEC)
-            .unwrap_or_else(|| panic!("Tube spec '{}' not found in registry", V2A_SPEC));
+    /// `v2a_quiescent_bias_volts` is V2A's solved quiescent V_gk — read it
+    /// from the built stage (`lut_quiescent_bias_volts`), don't author a
+    /// second copy. The circuit must stay standalone — never pass it to
+    /// `set_grid_circuit`; see [`TweedInner::grid_circuit`].
+    pub fn new(
+        engine_rate: EngineRate,
+        v1_source_z_ohms: f32,
+        v2a_quiescent_bias_volts: f32,
+    ) -> Self {
+        let v2a = specimen_physics(V2A_SPECIMEN)
+            .unwrap_or_else(|e| panic!("V2A specimen '{}': {}", V2A_SPECIMEN, e));
 
         let mut b = MnaCircuitBuilder::new(engine_rate);
 
@@ -640,15 +684,15 @@ impl V2aGridNetwork {
         );
         b.capacitor(tone_bottom, GND, Self::TONE_CAP_F);
 
-        b.capacitor(v2a_grid, GND, v2a_spec.miller_c_eff_farads());
+        b.capacitor(v2a_grid, GND, v2a.miller_c_eff_farads(PREAMP_PLATE_R_OHMS));
 
         b.grid_conduction(
             v2a_grid,
             GridConductionConfig {
-                grid_perveance: v2a_spec.grid_perveance,
-                contact_potential: v2a_spec.threshold.abs(),
+                grid_perveance: v2a.grid_perveance,
+                contact_potential: v2a.grid_threshold.abs(),
                 bias_type: GridBiasType::CathodeBias {
-                    cathode_voltage: -v2a_spec.bias_voltage,
+                    cathode_voltage: -v2a_quiescent_bias_volts,
                 },
             },
         );
@@ -686,6 +730,12 @@ pub struct TweedInner {
     pub current_tube_toggle: bool,
 
     pub v2a_tube: TubeStage,
+    /// The volume/tone network, held standalone rather than attached to V2A
+    /// via `set_grid_circuit`: an attached circuit gets its grid-conduction
+    /// clamp overwritten each solve with the stage's cathode *deviation*
+    /// (zero at idle), so the grid conducts ~1.2 V early and latches V2A
+    /// into cutoff.
+    pub grid_circuit: MnaCircuit,
     pub grid_norm_handle: PotHandle,
     pub grid_bright_handle: PotHandle,
     pub grid_tone_handle: PotHandle,
@@ -738,12 +788,9 @@ impl InnerDspProcessor for TweedInner {
         let n = self.norm_smoother.tick();
         let b = self.bright_smoother.tick();
         let t = self.tone_smoother.tick();
-        let h_n = self.grid_norm_handle;
-        let h_b = self.grid_bright_handle;
-        let h_t = self.grid_tone_handle;
-        self.v2a_tube.set_pot_position(h_n, n);
-        self.v2a_tube.set_pot_position(h_b, b);
-        self.v2a_tube.set_pot_position(h_t, t);
+        self.grid_circuit.set_pot_position(self.grid_norm_handle, n);
+        self.grid_circuit.set_pot_position(self.grid_bright_handle, b);
+        self.grid_circuit.set_pot_position(self.grid_tone_handle, t);
     }
 
     fn process_inner(&mut self, input: f32) -> f32 {
@@ -769,12 +816,14 @@ impl InnerDspProcessor for TweedInner {
                 .process_pair(v1a_input, v1b_input, b_plus_preamp)
         };
 
+        // Driver order matches `V2aGridNetwork::new`; the output node is V2A's grid.
+        let v2a_grid = self
+            .grid_circuit
+            .process(&[v1_out.plate_a_ac_volts, v1_out.plate_b_ac_volts]);
+
         let v2a_out = self
             .v2a_tube
-            .process_multi(
-                &[v1_out.plate_a_ac_volts, v1_out.plate_b_ac_volts],
-                b_plus_preamp,
-            )
+            .process(v2a_grid, b_plus_preamp)
             .plate_ac_volts;
 
         let pi_input = self.coupling_v2a.process(v2a_out);
@@ -821,6 +870,7 @@ impl InnerDspProcessor for TweedInner {
     fn reset(&mut self) {
         self.v1_pair_stock.reset();
         self.v1_pair_mod.reset();
+        self.grid_circuit.reset();
         self.v2a_tube.reset();
         self.coupling_v2a.reset();
         self.amp_topology.reset();
@@ -980,8 +1030,8 @@ impl AudioState {
     ) -> Self {
         let engine_rate = EngineRate::new(sample_rate, os_factor);
 
-        let v1_pair_stock = build_v1_pair(engine_rate, V1_STOCK_SPEC);
-        let v1_pair_mod = build_v1_pair(engine_rate, V1_MOD_SPEC);
+        let v1_pair_stock = build_v1_pair(engine_rate, V1_STOCK_SPECIMEN, V1_STOCK_BIAS_V);
+        let v1_pair_mod = build_v1_pair(engine_rate, V1_MOD_SPECIMEN, V1_MOD_BIAS_V);
 
         let amp_topology =
             AmpTopology::new(engine_rate, build_5e3_amp_topology_config());
@@ -992,20 +1042,20 @@ impl AudioState {
         // network (~21kΩ 12AY7 vs ~38kΩ 12AX7), which shapes the bright
         // cap's HF lift.
         let tube_toggle = params.tube_toggle.value();
-        let v1_spec_name = if tube_toggle { V1_MOD_SPEC } else { V1_STOCK_SPEC };
-        let v1_spec = TubeRegistry::global()
-            .lookup(v1_spec_name)
-            .unwrap_or_else(|| panic!("Tube spec '{}' not found in registry", v1_spec_name));
-        let v1_source_z = plate_source_impedance(v1_spec);
+        let v1_specimen = if tube_toggle { V1_MOD_SPECIMEN } else { V1_STOCK_SPECIMEN };
+        let v1_source_z = plate_source_impedance(v1_specimen);
 
-        let mut v2a_tube = build_v2a_tube(engine_rate);
+        let v2a_tube = build_v2a_tube(engine_rate);
         let V2aGridNetwork {
-            circuit,
+            mut circuit,
             norm_volume,
             bright_volume,
             tone,
-        } = V2aGridNetwork::new(engine_rate, v1_source_z);
-        v2a_tube.set_grid_circuit(circuit);
+        } = V2aGridNetwork::new(
+            engine_rate,
+            v1_source_z,
+            v2a_tube.lut_quiescent_bias_volts(),
+        );
 
         let coupling_v2a = CouplingCapacitor::new(
             engine_rate,
@@ -1018,15 +1068,16 @@ impl AudioState {
         let init_tone = params.tone.value();
 
         // Snap wipers to current settings so the smoother starts at steady state.
-        v2a_tube.set_pot_position(norm_volume, init_norm);
-        v2a_tube.set_pot_position(bright_volume, init_bright);
-        v2a_tube.set_pot_position(tone, init_tone);
+        circuit.set_pot_position(norm_volume, init_norm);
+        circuit.set_pot_position(bright_volume, init_bright);
+        circuit.set_pot_position(tone, init_tone);
 
         let inner = TweedInner {
             v1_pair_stock,
             v1_pair_mod,
             current_tube_toggle: tube_toggle,
             v2a_tube,
+            grid_circuit: circuit,
             grid_norm_handle: norm_volume,
             grid_bright_handle: bright_volume,
             grid_tone_handle: tone,
@@ -1381,17 +1432,18 @@ impl Plugin for TheTweed {
         // network on toggle and snap it to the current pot settings.
         let current_tube_toggle = self.params.tube_toggle.value();
         if current_tube_toggle != audio.engine.inner().current_tube_toggle {
-            let v1_spec_name = if current_tube_toggle { V1_MOD_SPEC } else { V1_STOCK_SPEC };
-            let v1_spec = TubeRegistry::global()
-                .lookup(v1_spec_name)
-                .unwrap_or_else(|| panic!("Tube spec '{}' not found in registry", v1_spec_name));
-            let v1_source_z = plate_source_impedance(v1_spec);
+            let v1_specimen =
+                if current_tube_toggle { V1_MOD_SPECIMEN } else { V1_STOCK_SPECIMEN };
+            let v1_source_z = plate_source_impedance(v1_specimen);
+            // V2A's Q is a property of its own MLUT — unchanged by the V1
+            // toggle; read it back from the existing stage.
+            let v2a_q = audio.engine.inner().v2a_tube.lut_quiescent_bias_volts();
             let V2aGridNetwork {
                 circuit,
                 norm_volume,
                 bright_volume,
                 tone,
-            } = V2aGridNetwork::new(audio.engine_rate, v1_source_z);
+            } = V2aGridNetwork::new(audio.engine_rate, v1_source_z, v2a_q);
 
             let normal_wiper = self
                 .volume_taper
@@ -1402,7 +1454,7 @@ impl Plugin for TheTweed {
             let tone_pos = self.params.tone.value();
 
             let inner = audio.engine.inner_mut();
-            inner.v2a_tube.set_grid_circuit(circuit);
+            inner.grid_circuit = circuit;
             inner.grid_norm_handle = norm_volume;
             inner.grid_bright_handle = bright_volume;
             inner.grid_tone_handle = tone;
@@ -1410,12 +1462,9 @@ impl Plugin for TheTweed {
             inner.norm_smoother.set_target(normal_wiper);
             inner.bright_smoother.set_target(bright_wiper);
             inner.tone_smoother.set_target(tone_pos);
-            let h_n = inner.grid_norm_handle;
-            let h_b = inner.grid_bright_handle;
-            let h_t = inner.grid_tone_handle;
-            inner.v2a_tube.set_pot_position(h_n, normal_wiper);
-            inner.v2a_tube.set_pot_position(h_b, bright_wiper);
-            inner.v2a_tube.set_pot_position(h_t, tone_pos);
+            inner.grid_circuit.set_pot_position(norm_volume, normal_wiper);
+            inner.grid_circuit.set_pot_position(bright_volume, bright_wiper);
+            inner.grid_circuit.set_pot_position(tone, tone_pos);
 
             let ceiling = {
                 let inner = audio.engine.inner();
@@ -1515,7 +1564,7 @@ impl Plugin for TheTweed {
                 let mut signal = audio.post_ir_buffer[i];
 
                 let output_trim = self.params.output_trim_db.smoothed.next();
-                signal *= neampmod_engine::db_to_linear(output_trim);
+                signal *= thermionicdsp::db_to_linear(output_trim);
 
                 let master = self.params.master.smoothed.next();
                 self.master_pot.set_position(master);
@@ -1619,3 +1668,753 @@ impl Vst3Plugin for TheTweed {
 
 nih_export_clap!(TheTweed);
 nih_export_vst3!(TheTweed);
+
+// =============================================================================
+// Diagnostic probes — play-test decay-buzz attribution; dumps stage taps to
+// /tmp/tweed_probe/. Run:
+//   cargo test --release decay_buzz_probe -- --ignored --nocapture
+// =============================================================================
+#[cfg(test)]
+mod decay_buzz_probe {
+    use super::*;
+    use thermionicdsp::BiquadFilter;
+
+    const SR: f32 = 48_000.0;
+    const BLOCK: usize = 256;
+    const RATE: EngineRate = EngineRate::new(SR, OversamplingFactor::X4);
+
+    // Minimal PCM 48 kHz WAV reader (16/32-bit int, first channel).
+    fn read_wav(path: &str) -> Vec<f32> {
+        let bytes = std::fs::read(path).expect("read WAV");
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        let mut pos = 12;
+        let (mut channels, mut bits) = (1u16, 16u16);
+        let mut data = Vec::new();
+        while pos + 8 <= bytes.len() {
+            let id = &bytes[pos..pos + 4];
+            let sz = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            if id == b"fmt " {
+                channels = u16::from_le_bytes(bytes[pos + 10..pos + 12].try_into().unwrap());
+                let rate = u32::from_le_bytes(bytes[pos + 12..pos + 16].try_into().unwrap());
+                bits = u16::from_le_bytes(bytes[pos + 22..pos + 24].try_into().unwrap());
+                assert_eq!(rate, 48_000, "WAV must be 48 kHz");
+                assert!(bits == 16 || bits == 32, "16/32-bit PCM only");
+            } else if id == b"data" {
+                let stride = (bits / 8) as usize * channels as usize;
+                data = bytes[pos + 8..pos + 8 + sz]
+                    .chunks_exact(stride)
+                    .map(|frame| match bits {
+                        16 => i16::from_le_bytes([frame[0], frame[1]]) as f32 / 32768.0,
+                        _ => {
+                            i32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as f32
+                                / 2_147_483_648.0
+                        }
+                    })
+                    .collect();
+            }
+            pos += 8 + sz + (sz & 1);
+        }
+        assert!(!data.is_empty(), "no data chunk");
+        data
+    }
+
+    fn write_wav_f32(path: &std::path::Path, x: &[f32]) {
+        let n = x.len() as u32;
+        let mut b = Vec::with_capacity(44 + 4 * x.len());
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + 4 * n).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&48_000u32.to_le_bytes());
+        b.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+        b.extend_from_slice(&4u16.to_le_bytes());
+        b.extend_from_slice(&32u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&(4 * n).to_le_bytes());
+        for &v in x {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(path, b).expect("write WAV");
+    }
+
+    /// Mirror of `AudioState::build` at the reported knob settings.
+    fn build_playtest_inner() -> TweedInner {
+        let taper = PotTaperConfig::new(PotTaper::Audio30A);
+        // Front-panel 1–12 scale → normalised param value.
+        let init_norm = taper.wiper_fraction(3.0 / 12.0);
+        let init_bright = taper.wiper_fraction(1.5 / 12.0);
+        let init_tone = 4.5 / 12.0;
+
+        let v1_pair_stock = build_v1_pair(RATE, V1_STOCK_SPECIMEN, V1_STOCK_BIAS_V);
+        let v1_pair_mod = build_v1_pair(RATE, V1_MOD_SPECIMEN, V1_MOD_BIAS_V);
+        let amp_topology = AmpTopology::new(RATE, build_5e3_amp_topology_config());
+        let preamp_tap = amp_topology.b_plus_tap("preamp");
+        let power_tube_tap = amp_topology.b_plus_tap("power_tube");
+        let v1_source_z = plate_source_impedance(V1_STOCK_SPECIMEN);
+        let v2a_tube = build_v2a_tube(RATE);
+        let V2aGridNetwork {
+            mut circuit,
+            norm_volume,
+            bright_volume,
+            tone,
+        } = V2aGridNetwork::new(RATE, v1_source_z, v2a_tube.lut_quiescent_bias_volts());
+        circuit.set_pot_position(norm_volume, init_norm);
+        circuit.set_pot_position(bright_volume, init_bright);
+        circuit.set_pot_position(tone, init_tone);
+
+        TweedInner {
+            v1_pair_stock,
+            v1_pair_mod,
+            current_tube_toggle: false, // AY (stock)
+            v2a_tube,
+            grid_circuit: circuit,
+            grid_norm_handle: norm_volume,
+            grid_bright_handle: bright_volume,
+            grid_tone_handle: tone,
+            norm_smoother: PotSmoother::new(SR, init_norm, POT_SMOOTH_TAU_S),
+            bright_smoother: PotSmoother::new(SR, init_bright, POT_SMOOTH_TAU_S),
+            tone_smoother: PotSmoother::new(SR, init_tone, POT_SMOOTH_TAU_S),
+            coupling_v2a: CouplingCapacitor::new(
+                RATE,
+                V2A_TO_V2B_COUPLING_CAP_F,
+                V2B_GRID_LEAK_OHMS,
+            ),
+            amp_topology,
+            preamp_tap,
+            power_tube_tap,
+            current_channel_mode: ChannelMode::Bright,
+            preamp_current_sum: 0.0,
+            preamp_current_count: 0,
+            meter_this_host_sample: false,
+            v1_plate_sum: 0.0,
+            v2_plate_sum: 0.0,
+            v3v4_plate_sum: 0.0,
+            plate_samples_counted: 0,
+        }
+    }
+
+    /// Windowed (50 ms) RMS + fraction of energy above 3 kHz.
+    fn window_metrics(x: &[f32]) -> Vec<(f32, f32)> {
+        let win = (SR * 0.05) as usize;
+        let mut hp = BiquadFilter::highpass(3_000.0, std::f32::consts::FRAC_1_SQRT_2, SR);
+        x.chunks(win)
+            .map(|chunk| {
+                let (mut total, mut high) = (0.0f64, 0.0f64);
+                for &s in chunk {
+                    let h = hp.process(s);
+                    total += (s as f64) * (s as f64);
+                    high += (h as f64) * (h as f64);
+                }
+                (
+                    (total / chunk.len() as f64).sqrt() as f32,
+                    if total > 0.0 { (high / total) as f32 } else { 0.0 },
+                )
+            })
+            .collect()
+    }
+
+    /// A/B V2A against the 5E3 print (plate 164 V, V_gk −1.2 V): the plugin
+    /// frame (LUT Rk=0, runtime 1.5 kΩ‖25 µF — bypassed at audio) vs a
+    /// TriodeX-style frame (Rk baked into the LUT, unbypassed).
+    /// Theory: bypassed ≈ 59×, unbypassed ≈ 30×.
+    #[test]
+    #[ignore = "diagnostic probe; run explicitly with --ignored --nocapture"]
+    fn v2a_frame_ab() {
+        let inner_sr = RATE.inner_sr();
+        let mut frames: Vec<(&str, TubeStage)> = Vec::new();
+        frames.push(("plugin (bypassed)", build_v2a_tube(RATE)));
+        let tx_ll = LoadLineConfig {
+            topology: LoadLineTopology::Triode {
+                plate_operating_points: vec![
+                    1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.71, 0.67, 0.63, 0.59, 0.55, 0.51,
+                    0.47, 0.43, 0.39, 0.35,
+                ],
+            },
+            plate_resistor_ohms: PREAMP_PLATE_R_OHMS as f64,
+            cathode_resistor_ohms: 1500.0,
+            reference_bplus: 330.0,
+            reference_bias: BiasSpec::Authored(0.0),
+        };
+        let mut tx = TubeStage::from_specimen_id(
+            RATE,
+            V2A_SPECIMEN,
+            &tx_ll,
+            TubeStageConfig::default(),
+        )
+        .expect("TriodeX-style V2A frame must build");
+        tx.set_plate_bplus_voltage(PREAMP_BPLUS_5E3);
+        frames.push(("triodex (baked 1.5k)", tx));
+
+        eprintln!("\n=== V2A frame A/B — print: plate 164 V, V_gk −1.2 V, rail 247 V ===");
+        for (label, mut stage) in frames {
+            // Settle to DC.
+            for _ in 0..(inner_sr * 0.5) as usize {
+                stage.process(0.0, PREAMP_BPLUS_5E3);
+            }
+            let v_plate_dc = stage.instantaneous_plate_volts();
+            let q_bias = stage.lut_quiescent_bias_volts();
+            // Small-signal gain at 220 Hz, 10 mV pk.
+            let w = 2.0 * std::f32::consts::PI * 220.0 / inner_sr;
+            let n = (inner_sr * 2.0) as usize;
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for i in 0..n {
+                let x = 0.010 * (w * i as f32).sin();
+                let y = stage.process(x, PREAMP_BPLUS_5E3).plate_ac_volts;
+                if i >= n / 2 {
+                    let p = w as f64 * i as f64;
+                    re += y as f64 * p.cos();
+                    im += y as f64 * p.sin();
+                }
+            }
+            let amp = 2.0 * (re * re + im * im).sqrt() / (n - n / 2) as f64;
+            eprintln!(
+                "  {label:<22} plate DC {v_plate_dc:>7.1} V   LUT Q {q_bias:>6.2} V   gain {:>6.1}x ({:.1} dB)",
+                amp / 0.010,
+                20.0 * (amp / 0.010).log10()
+            );
+        }
+    }
+
+    /// Small-signal gain ladder at the same knob settings: 10 mV, 220 Hz
+    /// and 2 kHz (above/below the bright-cap corner) — no stage clips, so
+    /// the numbers are clean stage gains.
+    #[test]
+    #[ignore = "diagnostic probe; run explicitly with --ignored --nocapture"]
+    fn small_signal_ladder() {
+        for f0 in [220.0f32, 2_000.0] {
+            let input_cal = InputCalibration::amp_standard();
+            let jack = JackInput::new(68_000.0, 1_000_000.0);
+            let mut engine: DspEngine<TweedInner, X4Boundary> =
+                DspEngine::new(RATE, X4Boundary::new(RATE), build_playtest_inner());
+            let w = 2.0 * std::f32::consts::PI * f0 / SR;
+            let total = (SR * 3.0) as usize;
+            let (mut ot, mut v2a, mut v1a) =
+                (Vec::new(), Vec::new(), Vec::new());
+            let vin_pk = 0.010f32; // volts at the jack — pre-calibration input
+            let g = vin_pk / (jack.dc_gain() * input_cal.input_scale());
+            let mut n = 0usize;
+            while n < total {
+                let block = BLOCK.min(total - n);
+                engine.begin_buffer(block);
+                for _ in 0..block {
+                    let x = g * (w * n as f32).sin();
+                    let conditioned = jack.process(input_cal.process(x));
+                    ot.push(engine.process_sample(conditioned));
+                    let inner = engine.inner();
+                    v2a.push(inner.v2a_tube.instantaneous_plate_volts());
+                    v1a.push(inner.v1_pair_stock.instantaneous_plate_a_volts());
+                    n += 1;
+                }
+                engine.end_buffer();
+            }
+            let amp = |x: &[f32]| -> f32 {
+                let tail = &x[(SR * 1.5) as usize..];
+                let mean = tail.iter().map(|&v| v as f64).sum::<f64>() / tail.len() as f64;
+                let om = 2.0 * std::f64::consts::PI * f0 as f64 / SR as f64;
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for (i, &v) in tail.iter().enumerate() {
+                    let p = om * i as f64;
+                    re += (v as f64 - mean) * p.cos();
+                    im += (v as f64 - mean) * p.sin();
+                }
+                (2.0 * (re * re + im * im).sqrt() / tail.len() as f64) as f32
+            };
+            let (a1, a2, ao) = (amp(&v1a), amp(&v2a), amp(&ot));
+            eprintln!(
+                "\n=== small-signal ladder, {f0} Hz, {:.1} mV pk at V1 grid ===",
+                vin_pk * 1e3
+            );
+            eprintln!("  V1a plate: {a1:>9.4} V  (gain {:.1}x)", a1 / vin_pk);
+            eprintln!(
+                "  V2A plate: {a2:>9.4} V  (V1a->V2A grid transfer x V2A gain: {:.2}x)",
+                a2 / a1
+            );
+            eprintln!("  OT sec:    {ao:>9.4} V  (total {:.0}x)", ao / vin_pk);
+        }
+    }
+
+    /// Render the playtest chain. `dynamic_clamp` updates the grid network's
+    /// conduction clamp from V2A's live absolute cathode once per host sample.
+    /// Returns (ot, mic, per-window (fizz, conduction µA·s, cathode V)).
+    fn render_playtest(
+        di: &[f32],
+        os: OversamplingFactor,
+        dynamic_clamp: bool,
+    ) -> (Vec<f32>, Vec<f32>, Vec<(f32, f32, f32)>) {
+        let rate = EngineRate::new(SR, os);
+        let peak = di.iter().fold(0.0f32, |m, &x| m.max(x.abs())).max(1e-9);
+        let g = 10f32.powf(-12.0 / 20.0) / peak;
+        let input_cal = InputCalibration::amp_standard();
+        let jack = JackInput::new(68_000.0, 1_000_000.0);
+
+        fn build_inner_at(rate: EngineRate) -> TweedInner {
+            // Same construction as `build_playtest_inner`, parameterised rate.
+            let taper = PotTaperConfig::new(PotTaper::Audio30A);
+            let init_norm = taper.wiper_fraction(3.0 / 12.0);
+            let init_bright = taper.wiper_fraction(1.5 / 12.0);
+            let init_tone = 4.5 / 12.0;
+            let v1_pair_stock = build_v1_pair(rate, V1_STOCK_SPECIMEN, V1_STOCK_BIAS_V);
+            let v1_pair_mod = build_v1_pair(rate, V1_MOD_SPECIMEN, V1_MOD_BIAS_V);
+            let amp_topology = AmpTopology::new(rate, build_5e3_amp_topology_config());
+            let preamp_tap = amp_topology.b_plus_tap("preamp");
+            let power_tube_tap = amp_topology.b_plus_tap("power_tube");
+            let v1_source_z = plate_source_impedance(V1_STOCK_SPECIMEN);
+            let v2a_tube = build_v2a_tube(rate);
+            let V2aGridNetwork {
+                mut circuit,
+                norm_volume,
+                bright_volume,
+                tone,
+            } = V2aGridNetwork::new(rate, v1_source_z, v2a_tube.lut_quiescent_bias_volts());
+            circuit.set_pot_position(norm_volume, init_norm);
+            circuit.set_pot_position(bright_volume, init_bright);
+            circuit.set_pot_position(tone, init_tone);
+            TweedInner {
+                v1_pair_stock,
+                v1_pair_mod,
+                current_tube_toggle: false,
+                v2a_tube,
+                grid_circuit: circuit,
+                grid_norm_handle: norm_volume,
+                grid_bright_handle: bright_volume,
+                grid_tone_handle: tone,
+                norm_smoother: PotSmoother::new(SR, init_norm, POT_SMOOTH_TAU_S),
+                bright_smoother: PotSmoother::new(SR, init_bright, POT_SMOOTH_TAU_S),
+                tone_smoother: PotSmoother::new(SR, init_tone, POT_SMOOTH_TAU_S),
+                coupling_v2a: CouplingCapacitor::new(
+                    rate,
+                    V2A_TO_V2B_COUPLING_CAP_F,
+                    V2B_GRID_LEAK_OHMS,
+                ),
+                amp_topology,
+                preamp_tap,
+                power_tube_tap,
+                current_channel_mode: ChannelMode::Bright,
+                preamp_current_sum: 0.0,
+                preamp_current_count: 0,
+                meter_this_host_sample: false,
+                v1_plate_sum: 0.0,
+                v2_plate_sum: 0.0,
+                v3v4_plate_sum: 0.0,
+                plate_samples_counted: 0,
+            }
+        }
+
+        macro_rules! run {
+            ($boundary:ty) => {{
+                let mut engine: DspEngine<TweedInner, $boundary> = DspEngine::new(
+                    rate,
+                    <$boundary>::new(rate),
+                    build_inner_at(rate),
+                );
+                let mut cab = build_cab_processor(
+                    SR,
+                    BLOCK,
+                    DEFAULT_SPEAKER_ID,
+                    DEFAULT_CABINET_ID,
+                    "sennheiser_md421",
+                    RoomSelection::SmallStudio,
+                    MicrophonePlacement {
+                        distance_m: 5.5 * 0.0254,
+                        radial_offset_cm: 4.0,
+                        off_axis_angle_deg: 0.0,
+                    },
+                );
+                let mut ot = Vec::with_capacity(di.len());
+                let win = (SR * 0.05) as usize;
+                let mut winstats: Vec<(f32, f32, f32)> = Vec::new();
+                let (mut cond_acc, mut vk_max) = (0.0f64, 0.0f32);
+                for block in di.chunks(BLOCK) {
+                    engine.begin_buffer(block.len());
+                    for &x in block {
+                        let conditioned = jack.process(input_cal.process(x * g));
+                        ot.push(engine.process_sample(conditioned));
+                        let inner = engine.inner_mut();
+                        let vk_abs =
+                            inner.v2a_tube.grid_voltage_volts() - inner.v2a_tube.vgk_volts();
+                        vk_max = vk_max.max(vk_abs);
+                        cond_acc += inner.grid_circuit.grid_conduction_current(0) as f64;
+                        if dynamic_clamp {
+                            inner.grid_circuit.set_grid_bias_all(vk_abs);
+                        }
+                        if ot.len() % win == 0 {
+                            winstats.push((
+                                0.0, // fizz filled later
+                                (cond_acc / SR as f64 * 1e6) as f32, // µA·s this window
+                                vk_max,
+                            ));
+                            cond_acc = 0.0;
+                            vk_max = 0.0;
+                        }
+                    }
+                    engine.end_buffer();
+                }
+                let mic: Vec<f32> = ot
+                    .iter()
+                    .map(|&v| {
+                        let (l, r) = cab.process(v, 1.0);
+                        0.5 * (l + r)
+                    })
+                    .collect();
+                let m = window_metrics(&mic);
+                for (i, s) in winstats.iter_mut().enumerate() {
+                    s.0 = m.get(i).map_or(0.0, |&(_, f)| f);
+                }
+                (ot, mic, winstats)
+            }};
+        }
+        match os {
+            OversamplingFactor::X4 => run!(X4Boundary),
+            OversamplingFactor::X8 => run!(X8Boundary),
+            other => panic!("probe supports X4/X8, got {other:?}"),
+        }
+    }
+
+    /// A/B frozen vs dynamic conduction clamp, and X4 vs X8 oversampling, at
+    /// the playtest settings. All four mic renders dumped for listening.
+    #[test]
+    #[ignore = "diagnostic probe; run explicitly with --ignored --nocapture"]
+    fn clamp_and_os_ab() {
+        let dir = std::path::Path::new("/tmp/tweed_probe");
+        std::fs::create_dir_all(dir).expect("mkdir");
+        let samples_dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../thermionic-products/ThermionicDSP/samples"
+        );
+        let mut di = vec![0.0f32; (SR * 1.0) as usize];
+        di.extend(read_wav(&format!("{samples_dir}/di_chord.wav")));
+
+        let arms: [(&str, OversamplingFactor, bool); 4] = [
+            ("x4_frozen", OversamplingFactor::X4, false),
+            ("x4_dynamic", OversamplingFactor::X4, true),
+            ("x8_frozen", OversamplingFactor::X8, false),
+            ("x8_dynamic", OversamplingFactor::X8, true),
+        ];
+        let mut results = Vec::new();
+        for (name, os, dynamic) in arms {
+            let (_ot, mic, stats) = render_playtest(&di, os, dynamic);
+            let peak = mic.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-9);
+            let norm: Vec<f32> = mic.iter().map(|&v| 0.891 * v / peak).collect();
+            write_wav_f32(&dir.join(format!("ab_{name}.wav")), &norm);
+            eprintln!("  wrote /tmp/tweed_probe/ab_{name}.wav");
+            results.push((name, stats));
+        }
+
+        // Aligned fizz/conduction/cathode table around the fizziest window
+        // (the attack region — where clamp error and aliasing both peak).
+        let peak_w = results[0]
+            .1
+            .iter()
+            .enumerate()
+            .skip(20)
+            .max_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(24);
+        eprintln!(
+            "\n  {:>7} | {:>8} {:>9} {:>7} | {:>8} {:>9} {:>7} | {:>8} {:>8}",
+            "t (s)", "frz f%", "frz µA·s", "frz Vk", "dyn f%", "dyn µA·s", "dyn Vk", "x8frz f%", "x8dyn f%"
+        );
+        let lo = peak_w.saturating_sub(4);
+        let hi = (peak_w + 44).min(results[0].1.len());
+        for w in lo..hi {
+            let a = results[0].1[w];
+            let b = results[1].1[w];
+            let c = results[2].1[w];
+            let d = results[3].1[w];
+            eprintln!(
+                "  {:>7.2} | {:>8.2} {:>9.3} {:>7.2} | {:>8.2} {:>9.3} {:>7.2} | {:>8.2} {:>8.2}",
+                w as f32 * 0.05,
+                100.0 * a.0,
+                a.1,
+                a.2,
+                100.0 * b.0,
+                b.1,
+                b.2,
+                100.0 * c.0,
+                100.0 * d.0,
+            );
+        }
+    }
+
+    /// Bisect the acoustic chain against the Ardour capture: render the
+    /// exported DI through the amp once, then through per-stage cab-chain
+    /// arms, to locate which stage owns a given spectral feature.
+    #[test]
+    #[ignore = "diagnostic probe; run explicitly with --ignored --nocapture"]
+    fn ardour_bisect() {
+        let dir = std::path::Path::new("/tmp/tweed_probe");
+        std::fs::create_dir_all(dir).expect("mkdir");
+        // Plain-PCM mono conversion of the Ardour export (same samples).
+        let di = read_wav("/tmp/tweed_probe/di_in_mono.wav");
+
+        let input_cal = InputCalibration::amp_standard();
+        let jack = JackInput::new(68_000.0, 1_000_000.0);
+        let mut engine: DspEngine<TweedInner, X4Boundary> =
+            DspEngine::new(RATE, X4Boundary::new(RATE), build_playtest_inner());
+        let mut ot = Vec::with_capacity(di.len());
+        for block in di.chunks(BLOCK) {
+            engine.begin_buffer(block.len());
+            for &x in block {
+                let conditioned = jack.process(input_cal.process(x));
+                ot.push(engine.process_sample(conditioned));
+            }
+            engine.end_buffer();
+        }
+        let peak = ot.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-9);
+        write_wav_f32(
+            &dir.join("bisect_ot.wav"),
+            &ot.iter().map(|&v| 0.891 * v / peak).collect::<Vec<_>>(),
+        );
+        eprintln!("  OT secondary peak: {peak:.2} V");
+
+        // (label, speaker, response, cabinet, mic, room)
+        let arms: [(&str, bool, bool, bool, bool, bool); 6] = [
+            ("full", true, true, true, true, true),
+            ("no_room", true, true, true, true, false),
+            ("no_mic", true, true, true, false, true),
+            ("no_cab", true, true, false, true, true),
+            ("no_response", true, false, true, true, true),
+            ("no_speaker", false, true, true, true, true),
+        ];
+        for (label, speaker, response, cabinet, mic, room) in arms {
+            let mut chain = SpeakerCabRoomProcessor::new(
+                SR,
+                BLOCK,
+                SpeakerCabRoomConfig {
+                    speaker_wiring: SpeakerWiring::single(DEFAULT_SPEAKER_ID),
+                    cabinet_id: DEFAULT_CABINET_ID.into(),
+                    microphone_id: "sennheiser_md421".into(),
+                    placement: MicrophonePlacement {
+                        distance_m: 5.5 * 0.0254,
+                        radial_offset_cm: 4.0,
+                        off_axis_angle_deg: 0.0,
+                    },
+                    room_id: "small_studio".into(),
+                    mic_preamp_gain_db: 35.0,
+                    speaker_enabled: speaker,
+                    response_enabled: response,
+                    cabinet_enabled: cabinet,
+                    mic_enabled: mic,
+                    room_enabled: room,
+                },
+            );
+            let out: Vec<f32> = ot
+                .iter()
+                .map(|&v| {
+                    let (l, r) = chain.process(v, 1.0);
+                    0.5 * (l + r)
+                })
+                .collect();
+            let peak = out.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-9);
+            write_wav_f32(
+                &dir.join(format!("bisect_{label}.wav")),
+                &out.iter().map(|&v| 0.891 * v / peak).collect::<Vec<_>>(),
+            );
+            eprintln!("  wrote bisect_{label}.wav (peak {peak:.4})");
+        }
+    }
+
+    /// Wall time per 256-sample buffer (amp + cab, same thread) against the
+    /// 5.33 ms real-time budget — over-budget buffers are audible dropouts.
+    #[test]
+    #[ignore = "diagnostic probe; run explicitly with --ignored --nocapture"]
+    fn buffer_time_profile() {
+        let samples_dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../thermionic-products/ThermionicDSP/samples"
+        );
+        let mut di = vec![0.0f32; (SR * 1.0) as usize];
+        di.extend(read_wav(&format!("{samples_dir}/di_chord.wav")));
+        let peak = di.iter().fold(0.0f32, |m, &x| m.max(x.abs())).max(1e-9);
+        let g = 10f32.powf(-12.0 / 20.0) / peak;
+        let input_cal = InputCalibration::amp_standard();
+        let jack = JackInput::new(68_000.0, 1_000_000.0);
+        let mut engine: DspEngine<TweedInner, X4Boundary> =
+            DspEngine::new(RATE, X4Boundary::new(RATE), build_playtest_inner());
+        let mut cab = build_cab_processor(
+            SR,
+            BLOCK,
+            DEFAULT_SPEAKER_ID,
+            DEFAULT_CABINET_ID,
+            "sennheiser_md421",
+            RoomSelection::SmallStudio,
+            MicrophonePlacement {
+                distance_m: 5.5 * 0.0254,
+                radial_offset_cm: 4.0,
+                off_axis_angle_deg: 0.0,
+            },
+        );
+
+        let budget_us = BLOCK as f64 / SR as f64 * 1e6;
+        let mut times_us: Vec<f64> = Vec::new();
+        for block in di.chunks(BLOCK) {
+            let t0 = std::time::Instant::now();
+            engine.begin_buffer(block.len());
+            for &x in block {
+                let conditioned = jack.process(input_cal.process(x * g));
+                let v = engine.process_sample(conditioned);
+                let _ = cab.process(v, 1.0);
+            }
+            engine.end_buffer();
+            times_us.push(t0.elapsed().as_secs_f64() * 1e6);
+        }
+        let mut sorted = times_us.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |p: f64| sorted[((sorted.len() - 1) as f64 * p) as usize];
+        let over = times_us.iter().filter(|&&t| t > budget_us).count();
+        let over80 = times_us.iter().filter(|&&t| t > 0.8 * budget_us).count();
+        eprintln!("\n=== Buffer time profile, playtest settings, 256 @ 48 kHz ===");
+        eprintln!("  budget {budget_us:.0} µs/buffer, {} buffers", times_us.len());
+        eprintln!(
+            "  p50 {:.0}  p90 {:.0}  p99 {:.0}  max {:.0} µs  ({:.0}% of budget at p99)",
+            pct(0.5),
+            pct(0.9),
+            pct(0.99),
+            sorted[sorted.len() - 1],
+            100.0 * pct(0.99) / budget_us
+        );
+        eprintln!(
+            "  buffers over budget: {over}; over 80% of budget: {over80}"
+        );
+        // Worst 10 buffers with their positions in the performance.
+        let mut idx: Vec<usize> = (0..times_us.len()).collect();
+        idx.sort_by(|&a, &b| times_us[b].partial_cmp(&times_us[a]).unwrap());
+        eprintln!("  worst buffers (t, µs):");
+        for &i in idx.iter().take(10) {
+            eprintln!(
+                "    {:>7.2} s  {:>7.0} µs ({:>3.0}%)",
+                i as f32 * BLOCK as f32 / SR,
+                times_us[i],
+                100.0 * times_us[i] / budget_us
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic probe; run explicitly with --ignored --nocapture"]
+    fn playtest_render() {
+        let dir = std::path::Path::new("/tmp/tweed_probe");
+        std::fs::create_dir_all(dir).expect("mkdir");
+        let samples_dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../thermionic-products/ThermionicDSP/samples"
+        );
+
+        for stem in ["di_chord", "di_low_e"] {
+            let mut di = vec![0.0f32; (SR * 1.0) as usize];
+            di.extend(read_wav(&format!("{samples_dir}/{stem}.wav")));
+            // Input peaks −12 dBFS at the DAW, trims at 0 dB.
+            let peak = di.iter().fold(0.0f32, |m, &x| m.max(x.abs())).max(1e-9);
+            let g = 10f32.powf(-12.0 / 20.0) / peak;
+
+            let input_cal = InputCalibration::amp_standard();
+            let jack = JackInput::new(68_000.0, 1_000_000.0);
+            let mut engine: DspEngine<TweedInner, X4Boundary> =
+                DspEngine::new(RATE, X4Boundary::new(RATE), build_playtest_inner());
+            let mut cab = build_cab_processor(
+                SR,
+                BLOCK,
+                DEFAULT_SPEAKER_ID,
+                DEFAULT_CABINET_ID,
+                "sennheiser_md421",
+                RoomSelection::SmallStudio,
+                MicrophonePlacement {
+                    distance_m: 5.5 * 0.0254,
+                    radial_offset_cm: 4.0,
+                    off_axis_angle_deg: 0.0,
+                },
+            );
+
+            let mut ot = Vec::with_capacity(di.len());
+            let mut v2a = Vec::with_capacity(di.len());
+            let mut v1a = Vec::with_capacity(di.len());
+            let mut mic = Vec::with_capacity(di.len());
+            for block in di.chunks(BLOCK) {
+                engine.begin_buffer(block.len());
+                for &x in block {
+                    let conditioned = jack.process(input_cal.process(x * g));
+                    let v = engine.process_sample(conditioned);
+                    ot.push(v);
+                    let inner = engine.inner();
+                    v2a.push(inner.v2a_tube.instantaneous_plate_volts());
+                    v1a.push(inner.v1_pair_stock.instantaneous_plate_a_volts());
+                }
+                engine.end_buffer();
+            }
+            for &v in &ot {
+                let (l, r) = cab.process(v, 1.0);
+                mic.push(0.5 * (l + r));
+            }
+
+            for (tag, x) in [("ot", &ot), ("v2a", &v2a), ("v1a", &v1a), ("mic", &mic)] {
+                let peak = x.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-9);
+                let norm: Vec<f32> = x.iter().map(|&v| 0.891 * v / peak).collect();
+                write_wav_f32(&dir.join(format!("plugin_{stem}_{tag}.wav")), &norm);
+            }
+
+            // Gain ladder: absolute AC levels per tap over the loudest 100 ms.
+            let conditioned_pk = di
+                .iter()
+                .map(|&x| jack.dc_gain() * input_cal.input_scale() * (x * g).abs())
+                .fold(0.0f32, f32::max);
+            let ac_stats = |x: &[f32], label: &str| {
+                let mean = x.iter().map(|&v| v as f64).sum::<f64>() / x.len() as f64;
+                let win = (SR * 0.1) as usize;
+                let (mut pk, mut rms_best) = (0.0f32, 0.0f64);
+                for chunk in x.chunks(win) {
+                    let mut acc = 0.0f64;
+                    for &v in chunk {
+                        let a = (v as f64 - mean).abs();
+                        pk = pk.max(a as f32);
+                        acc += a * a;
+                    }
+                    rms_best = rms_best.max(acc / chunk.len() as f64);
+                }
+                eprintln!(
+                    "    {label:<28} peak {pk:>9.3} V   max-window RMS {:>8.3} V",
+                    rms_best.sqrt()
+                );
+            };
+            eprintln!("  gain ladder ({stem}):");
+            eprintln!(
+                "    {:<28} peak {conditioned_pk:>9.3} V",
+                "V1 grid (conditioned in)"
+            );
+            ac_stats(&v1a, "V1a plate (AC)");
+            ac_stats(&v2a, "V2A plate (AC)");
+            ac_stats(&ot, "OT secondary");
+
+            let m_ot = window_metrics(&ot);
+            let m_mic = window_metrics(&mic);
+            let m_v2a = window_metrics(&v2a);
+            let peak_w = m_ot
+                .iter()
+                .enumerate()
+                .skip(10)
+                .max_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap())
+                .map(|(i, _)| i)
+                .unwrap();
+            eprintln!("\n=== plugin chain, {stem}, user settings ===");
+            eprintln!(
+                "  {:>7} {:>9} {:>8} {:>8} {:>8}",
+                "t (s)", "ot dBV", "ot f%", "mic f%", "v2a f%"
+            );
+            let lo = peak_w.saturating_sub(4);
+            let hi = (peak_w + 50).min(m_ot.len());
+            for w in lo..hi {
+                let mark = if w == peak_w { "  <-- peak" } else { "" };
+                eprintln!(
+                    "  {:>7.2} {:>9.1} {:>8.2} {:>8.2} {:>8.2}{mark}",
+                    w as f32 * 0.05,
+                    20.0 * m_ot[w].0.max(1e-9).log10(),
+                    100.0 * m_ot[w].1,
+                    100.0 * m_mic[w].1,
+                    100.0 * m_v2a[w].1,
+                );
+            }
+        }
+    }
+}

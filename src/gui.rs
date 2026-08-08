@@ -10,7 +10,7 @@ use crate::{
     DEFAULT_SPEAKER_ID, DEFAULT_CABINET_ID,
     parse_os_factor, os_factor_str, os_factor_label,
 };
-use neampmod_engine::{
+use thermionicdsp::{
     OversamplingFactor, MicrophonePlacement, SpeakerRegistry,
     CabinetRegistry,
 };
