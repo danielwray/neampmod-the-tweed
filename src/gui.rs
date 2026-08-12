@@ -6,14 +6,13 @@ use std::sync::atomic::Ordering;
 use crate::{
     TheTweedParams, ChannelMode, CabModellingMode, MicSelection, MicXPosition, RoomSelection,
     IrLoadState, CabProcessorLoadState, ir_load_status, load_ir_file_into_state,
-    build_cab_processor,
+    build_cab_arm,
     DEFAULT_SPEAKER_ID, DEFAULT_CABINET_ID,
     parse_os_factor, os_factor_str, os_factor_label,
 };
-use thermionicdsp::{
-    OversamplingFactor, MicrophonePlacement, SpeakerRegistry,
-    CabinetRegistry,
-};
+use thermionicdsp::OversamplingFactor;
+use thermionicdsp::acoustic::MicrophonePlacement;
+use thermionicdsp::catalogue::{CabinetRegistry, SpeakerRegistry};
 
 const AMP_ON_IMAGE: &[u8] = include_bytes!("../gui/amp_on.png");
 const AMP_OFF_IMAGE: &[u8] = include_bytes!("../gui/amp_off.png");
@@ -237,12 +236,12 @@ fn mic_x_label(pos: MicXPosition) -> &'static str {
 
 fn mic_label(mic: MicSelection) -> &'static str {
     match mic {
-        MicSelection::ShureSm57 => "Shure SM57",
-        MicSelection::SennheiserMd421 => "Sennheiser MD 421-II",
-        MicSelection::RoyerR121 => "Royer R-121 Ribbon",
-        MicSelection::NeumannU87 => "Neumann U 87 Ai (Cardioid)",
-        MicSelection::Rca44Bx => "RCA 44-BX",
-        MicSelection::Rca77Dx => "RCA 77-DX",
+        MicSelection::Dynamic57 => "Shure SM57",
+        MicSelection::Dynamic421 => "Sennheiser MD 421-II",
+        MicSelection::Ribbon121 => "Royer R-121 Ribbon",
+        MicSelection::Condenser87 => "Neumann U 87 Ai (Cardioid)",
+        MicSelection::Ribbon44 => "RCA 44-BX",
+        MicSelection::Ribbon77 => "RCA 77-DX",
     }
 }
 
@@ -278,7 +277,9 @@ fn request_cab_rebuild(
         off_axis_angle_deg: 0.0,
     };
 
-    let processor = build_cab_processor(
+    // The whole arm is assembled here, off the audio thread, so installing it
+    // in `process` is a move rather than an allocation.
+    let arm = build_cab_arm(
         sample_rate,
         block_size,
         DEFAULT_SPEAKER_ID,
@@ -289,7 +290,7 @@ fn request_cab_rebuild(
     );
 
     if let Ok(mut pending) = state.cab_load_state.pending.lock() {
-        *pending = Some(processor);
+        *pending = Some(arm);
     }
 }
 
@@ -399,12 +400,12 @@ pub fn create(
                             .selected_text(mic_label(current_mic))
                             .show_ui(ui, |ui| {
                                 for variant in [
-                                    MicSelection::ShureSm57,
-                                    MicSelection::SennheiserMd421,
-                                    MicSelection::RoyerR121,
-                                    MicSelection::NeumannU87,
-                                    MicSelection::Rca44Bx,
-                                    MicSelection::Rca77Dx,
+                                    MicSelection::Dynamic57,
+                                    MicSelection::Dynamic421,
+                                    MicSelection::Ribbon121,
+                                    MicSelection::Condenser87,
+                                    MicSelection::Ribbon44,
+                                    MicSelection::Ribbon77,
                                 ] {
                                     if ui
                                         .selectable_label(
@@ -686,15 +687,10 @@ pub fn create(
                         );
                     }
 
-                    draw_image_knob_with_tooltip(
-                        ui,
-                        &mut state.textures,
-                        Pos2::new(715.0, 120.0),
-                        params.master.value(),
-                        "Master Volume",
-                        "Master Volume",
-                        |_ui, new_value| setter.set_parameter(&params.master, new_value),
-                    );
+                    // No Master knob: a real 5E3 has none, so it was a
+                    // fictional component in the signal path. Studio output
+                    // level lives on Output Trim in the IO row, at the
+                    // transduction boundary where it is honest.
 
                     let build_id = env!("CARGO_PKG_VERSION");
                     ui.painter().text(

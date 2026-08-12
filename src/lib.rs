@@ -5,48 +5,57 @@ use std::sync::atomic::Ordering;
 #[cfg(feature = "gui")]
 mod gui;
 
+// SDK building blocks (crate root) — engine wrapper, rate identity, amp
+// electrical core, preamp supply brokerage, acoustic chain, RT contract.
 use thermionicdsp::{
-    specimen_physics,
+    AmpIo,
+    AmpTopology,
+    AmpTopologyConfig,
+    CabBackEnd,
+    PreampSupply,
+    PreampTap,
+    enable_audio_thread_denormal_handling,
+    EngineRate,
+    OversamplingFactor,
+    InnerDspProcessor,
+    AnyDspEngine,
+    SpeakerCabRoomProcessor,
+    SpeakerCabRoomConfig,
+    MicChannel,
+    MicChannelConfig,
+};
+// Amp domain — electrical path at the oversampled inner rate, physical volts.
+use thermionicdsp::amp::{
     BiasSpec,
     LoadLineConfig,
     LoadLineTopology,
     TubeStage,
     TubeStageConfig,
-    AmpTopology,
-    AmpTopologyConfig,
+    SharedCathodeTriodePair,
+    SharedCathodeTriodePairConfig,
     BPlusTap,
-    CouplingCapacitor,
-    DCBlocker,
     InputCalibration,
     InputLevelMeter,
-    LoadboxDi,
-    MasterVolume,
-    ir_loader,
-    ir_convolver,
+    JackInput,
     PotTaper,
     PotTaperConfig,
-    JackInput,
-    enable_audio_thread_denormal_handling,
-    EngineRate,
-    OversamplingFactor,
-    X1Boundary,
-    X2Boundary,
-    X4Boundary,
-    X8Boundary,
-    InnerDspProcessor,
-    DspEngine,
-    SpeakerCabRoomProcessor,
-    SpeakerCabRoomConfig,
     SpeakerWiring,
+};
+// Acoustic domain — output transduction, mic placement, IR convolution.
+use thermionicdsp::acoustic::{
+    HotSwapConvolver,
+    IrLoader,
+    LoadboxDi,
     MicrophonePlacement,
+    ZeroLatencyConvolver,
 };
-use thermionicdsp::dsp::amps::tube_modeling::{
-    SharedCathodeTriodePair, SharedCathodeTriodePairConfig,
+// Circuit primitives — MNA solver and passive couplings.
+use thermionicdsp::circuit::{
+    CouplingCapacitor, GridBiasType, GridConductionConfig, MnaCircuit,
+    MnaCircuitBuilder, PotHandle, PotSmoother, GND,
 };
-use thermionicdsp::dsp::circuits::mna_circuit::{
-    GridBiasType, GridConductionConfig, MnaCircuit, MnaCircuitBuilder, PotHandle,
-    PotSmoother, GND,
-};
+// Tube specimen catalogue — per-specimen physics for construction-time LUTs.
+use thermionicdsp::catalogue::specimen_physics;
 
 const IR_CROSSFADE_MS: f32 = 30.0;
 
@@ -55,13 +64,27 @@ const IR_CROSSFADE_MS: f32 = 30.0;
 // every buffer.
 const METER_UPDATE_INTERVAL_MS: f32 = 100.0;
 
-// Must match the OT-load speaker in `AmpTopologyConfig::fender_5e3()` —
+// Must match the OT-load speaker in `AmpTopologyConfig::tweed_5e3()` —
 // the 5E3 shipped with a Jensen P12R, open-back 1x12.
-const DEFAULT_SPEAKER_ID: &str = "jensen_p12r";
-const DEFAULT_CABINET_ID: &str = "fender_5e3_open_back_1x12";
+const DEFAULT_SPEAKER_ID: &str = "p12r";
+const DEFAULT_CABINET_ID: &str = "tweed_5e3_open_back_1x12";
+
+// 5E3 input jack: each jack carries a 68kΩ grid stopper between tip and grid,
+// with a 1MΩ grid leak at the grid node.
+const JACK_SERIES_OHMS: f32 = 68_000.0;
+const JACK_GRID_LEAK_OHMS: f32 = 1_000_000.0;
+
+// Exit-boundary DC blocker corner. Host rate — `AmpIo` builds it through
+// `DCBlocker::host_rate`.
+const OUTPUT_DC_BLOCK_HZ: f32 = 10.0;
+
+// `OutputHealth::run_length` above this means an interior integrator has
+// latched and the amp is silent until rebuilt, rather than a one-off
+// non-finite sample that already recovered (contract §5).
+const LATCHED_SAMPLES: u32 = 512;
 
 pub struct IrLoadState {
-    pub pending: Mutex<Option<ir_convolver::ZeroLatencyConvolver>>,
+    pub pending: Mutex<Option<ZeroLatencyConvolver>>,
     pub sample_rate: atomic_float::AtomicF32,
     pub block_size: atomic::AtomicUsize,
     pub status: atomic::AtomicU8,
@@ -94,10 +117,12 @@ impl Default for IrLoadState {
     fn default() -> Self { Self::new() }
 }
 
-// Hot-swap slot: GUI builds a fresh SpeakerCabRoomProcessor and writes it
-// here; the audio thread try_locks once per buffer and swaps it in.
+// Hot-swap slot: the GUI builds a fresh Dynamic cab arm and writes it here;
+// the audio thread try_locks once per buffer and moves it in. The whole
+// `CabBackEnd` is assembled off-thread — including its `Box` — so the audio
+// thread only ever performs a move (contract §4).
 pub struct CabProcessorLoadState {
-    pub pending: Mutex<Option<SpeakerCabRoomProcessor>>,
+    pub pending: Mutex<Option<CabBackEnd>>,
 }
 
 impl CabProcessorLoadState {
@@ -121,7 +146,8 @@ pub fn build_cab_processor(
     room: RoomSelection,
     placement: MicrophonePlacement,
 ) -> SpeakerCabRoomProcessor {
-    let (room_id, room_enabled) = room.into_engine();
+    let room_id = room.registry_id().map(str::to_string);
+    let room_enabled = room_id.is_some();
     SpeakerCabRoomProcessor::new(
         sample_rate,
         max_buffer_size,
@@ -129,12 +155,18 @@ pub fn build_cab_processor(
             // 5E3 is a 1x12 — single driver, matches the OT-load speaker.
             speaker_wiring: SpeakerWiring::single(speaker_id),
             cabinet_id: cabinet_id.to_string(),
-            microphone_id: microphone_id.to_string(),
-            placement,
-            room_id: room_id.to_string(),
+            mic_primary: MicChannelConfig {
+                microphone_id: microphone_id.to_string(),
+                placement,
+                preamp_gain_db: 35.0,
+                polarity_inverted: false,
+                pan: 0.0,
+            },
+            // The 5E3 is a one-mic rig; `None` is the real absence.
+            mic_secondary: None,
+            room_id,
             // Lockstep with LoadboxDi's -10 dB pad so both cab arms land
             // in the same dBFS region.
-            mic_preamp_gain_db: 35.0,
             speaker_enabled: true,
             cabinet_enabled: true,
             mic_enabled: true,
@@ -144,19 +176,46 @@ pub fn build_cab_processor(
     )
 }
 
+/// The `Dynamic` cab arm, assembled whole. Boxing happens here — off the
+/// audio thread — so installing a rebuilt arm is a move, not an allocation.
+///
+/// `CabBackEnd` is what makes the transduction pairing unforgeable: this arm
+/// transduces internally (mic sensitivity × strip × converter) and therefore
+/// must never carry a `LoadboxDi`, while the `Ir` arm cannot exist without
+/// one. That used to be a comment; now the type holds it.
+pub fn build_cab_arm(
+    sample_rate: f32,
+    max_buffer_size: usize,
+    speaker_id: &str,
+    cabinet_id: &str,
+    microphone_id: &str,
+    room: RoomSelection,
+    placement: MicrophonePlacement,
+) -> CabBackEnd {
+    CabBackEnd::Dynamic(Box::new(build_cab_processor(
+        sample_rate,
+        max_buffer_size,
+        speaker_id,
+        cabinet_id,
+        microphone_id,
+        room,
+        placement,
+    )))
+}
+
 pub fn load_ir_file_into_state(state: &IrLoadState, path: &std::path::Path) {
     state.status.store(ir_load_status::LOADING, Ordering::Relaxed);
 
     let sample_rate = state.sample_rate.load(Ordering::Relaxed);
     let block_size = state.block_size.load(Ordering::Relaxed);
 
-    let loader = ir_loader::IrLoader::new(sample_rate);
+    let loader = IrLoader::new(sample_rate);
     match loader.load_from_file(path) {
         Ok((mut ir, _, _)) => {
-            ir_loader::IrLoader::remove_dc_offset(&mut ir);
-            ir_loader::IrLoader::normalize_response_peak(&mut ir);
+            IrLoader::remove_dc_offset(&mut ir);
+            IrLoader::normalize_response_peak(&mut ir);
             let fir_len = 128.min(block_size);
-            let conv = ir_convolver::ZeroLatencyConvolver::new(&ir, block_size, fir_len);
+            let conv = ZeroLatencyConvolver::new(&ir, block_size, fir_len);
             if let Ok(mut pending) = state.pending.lock() {
                 *pending = Some(conv);
             }
@@ -240,35 +299,35 @@ impl MicXPosition {
 // Kept in sync with `assets/config/microphones/v1/*.toml` in the engine.
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MicSelection {
-    #[id = "shure_sm57"]
+    #[id = "dynamic_57"]
     #[name = "Shure SM57"]
-    ShureSm57,
-    #[id = "sennheiser_md421"]
+    Dynamic57,
+    #[id = "dynamic_421"]
     #[name = "Sennheiser MD 421-II"]
-    SennheiserMd421,
-    #[id = "royer_r121"]
+    Dynamic421,
+    #[id = "ribbon_121"]
     #[name = "Royer R-121 Ribbon"]
-    RoyerR121,
-    #[id = "neumann_u87"]
+    Ribbon121,
+    #[id = "condenser_87"]
     #[name = "Neumann U 87 Ai (Cardioid)"]
-    NeumannU87,
-    #[id = "rca_44bx"]
+    Condenser87,
+    #[id = "ribbon_44"]
     #[name = "RCA 44-BX"]
-    Rca44Bx,
-    #[id = "rca_77dx"]
+    Ribbon44,
+    #[id = "ribbon_77"]
     #[name = "RCA 77-DX"]
-    Rca77Dx,
+    Ribbon77,
 }
 
 impl MicSelection {
     pub fn registry_id(self) -> &'static str {
         match self {
-            MicSelection::ShureSm57 => "shure_sm57",
-            MicSelection::SennheiserMd421 => "sennheiser_md421",
-            MicSelection::RoyerR121 => "royer_r121",
-            MicSelection::NeumannU87 => "neumann_u87",
-            MicSelection::Rca44Bx => "rca_44bx",
-            MicSelection::Rca77Dx => "rca_77dx",
+            MicSelection::Dynamic57 => "dynamic_57",
+            MicSelection::Dynamic421 => "dynamic_421",
+            MicSelection::Ribbon121 => "ribbon_121",
+            MicSelection::Condenser87 => "condenser_87",
+            MicSelection::Ribbon44 => "ribbon_44",
+            MicSelection::Ribbon77 => "ribbon_77",
         }
     }
 }
@@ -290,27 +349,28 @@ pub enum RoomSelection {
     LiveRoom,
     #[id = "small_bedroom"]
     #[name = "Small Bedroom"]
-    WoodenBarn,
+    SmallBedroom,
     #[id = "wooden_barn"]
     #[name = "Wooden Barn"]
-    SmallBedroom,
+    WoodenBarn,
     #[id = "iso_box"]
     #[name = "Iso Box"]
     IsoBox,
 }
 
 impl RoomSelection {
-    // `None` still resolves to a real id so the processor builds; the room
-    // stage is simply disabled via the flag.
-    pub fn into_engine(self) -> (&'static str, bool) {
+    /// The engine `room_id` this selection names, or `None` for no room at
+    /// all — the engine then builds no FDN, rather than constructing one and
+    /// bypassing it behind a flag.
+    pub fn registry_id(self) -> Option<&'static str> {
         match self {
-            RoomSelection::None => ("small_studio", false),
-            RoomSelection::SmallStudio => ("small_studio", true),
-            RoomSelection::LargeStudio => ("large_studio", true),
-            RoomSelection::LiveRoom => ("live_room", true),
-            RoomSelection::WoodenBarn => ("wooden_barn", true),
-            RoomSelection::SmallBedroom => ("small_bedroom", true),
-            RoomSelection::IsoBox => ("iso_box", true),
+            RoomSelection::None => None,
+            RoomSelection::SmallStudio => Some("small_studio"),
+            RoomSelection::LargeStudio => Some("large_studio"),
+            RoomSelection::LiveRoom => Some("live_room"),
+            RoomSelection::SmallBedroom => Some("small_bedroom"),
+            RoomSelection::WoodenBarn => Some("wooden_barn"),
+            RoomSelection::IsoBox => Some("iso_box"),
         }
     }
 }
@@ -334,9 +394,6 @@ struct TheTweedParams {
 
     #[id = "tube_toggle"]
     pub tube_toggle: BoolParam,
-
-    #[id = "master"]
-    pub master: FloatParam,
 
     #[id = "input_trim"]
     pub input_trim_db: FloatParam,
@@ -375,7 +432,7 @@ impl Default for TheTweedParams {
         Self {
             bright_volume: FloatParam::new(
                 "Bright",
-                0.7,
+                0.96,
                 FloatRange::Linear { min: 0.01, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Logarithmic(10.0))
@@ -384,18 +441,18 @@ impl Default for TheTweedParams {
 
             normal_volume: FloatParam::new(
                 "Normal",
-                0.4,
+                0.25,
                 FloatRange::Linear { min: 0.01, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Logarithmic(10.0))
             .with_value_to_string(v2s_dial_1_to_12())
             .with_string_to_value(s2v_dial_1_to_12()),
 
-            channel_select: EnumParam::new("Channel", ChannelMode::Both),
+            channel_select: EnumParam::new("Channel", ChannelMode::Normal),
 
             tone: FloatParam::new(
                 "Tone",
-                0.7,
+                0.45,
                 FloatRange::Linear { min: 0.01, max: 1.0 },
             )
             .with_smoother(SmoothingStyle::Logarithmic(5.0))
@@ -405,15 +462,6 @@ impl Default for TheTweedParams {
             power: BoolParam::new("Power", true),
 
             tube_toggle: BoolParam::new("Tube Toggle", false),
-
-            master: FloatParam::new(
-                "Master",
-                0.7,
-                FloatRange::Linear { min: 0.0001, max: 1.0 },
-            )
-            .with_smoother(SmoothingStyle::Logarithmic(10.0))
-            .with_value_to_string(v2s_dial_1_to_12())
-            .with_string_to_value(s2v_dial_1_to_12()),
 
             input_trim_db: FloatParam::new(
                 "Input Trim",
@@ -426,6 +474,25 @@ impl Default for TheTweedParams {
             .with_value_to_string(formatters::v2s_f32_rounded(1))
             .with_string_to_value(Arc::new(|s: &str| s.trim().parse().ok())),
 
+            // Default −6 dB, and it is compensation for a known engine
+            // defect, not a voicing choice. The dynamic arm's fixed 35 dB
+            // channel strip ignores mic sensitivity, so a full-crank 5E3
+            // burst lands past digital full scale on four of the six
+            // selectable mics (ThermionicDSP
+            // `tests/output_transduction_landing_probe.rs`, ignored, and
+            // `docs/plans/cabs/mic-room-audit.md` §1 — peak dBFS: U87 +18.2,
+            // R-121 +11.3, 77-DX +5.3, 44-BX +2.3, MD 421 −4.1, SM57 −9.7).
+            // −6 dB is sized for the DEFAULT mic (RCA 77-DX, +5.3), putting
+            // the default configuration just under FS; a U87 still needs
+            // roughly −19 dB from the user until the engine lands per-mic
+            // gain anchors (multi-mic.md §8.2), after which this default
+            // should return to 0.0.
+            //
+            // This is deliberately a visible, attributable trim at the
+            // transduction boundary rather than the fictional Master pot it
+            // replaces: the 5E3 has no master volume, and per-amp output
+            // trims and loudness normalisation are forbidden inside the
+            // signal path (the-contract.md §6).
             output_trim_db: FloatParam::new(
                 "Output Trim",
                 0.0,
@@ -446,7 +513,7 @@ impl Default for TheTweedParams {
 
             mic_distance_inches: FloatParam::new(
                 "Mic Distance",
-                6.0,
+                3.0,
                 FloatRange::Linear { min: 0.1, max: 24.0 },
             )
             .with_unit(" in")
@@ -455,7 +522,7 @@ impl Default for TheTweedParams {
             .with_value_to_string(formatters::v2s_f32_rounded(1))
             .with_string_to_value(Arc::new(|s: &str| s.trim().parse().ok())),
 
-            microphone: EnumParam::new("Mic", MicSelection::Rca77Dx),
+            microphone: EnumParam::new("Mic", MicSelection::Dynamic57),
             room_selection: EnumParam::new(
                 "Room",
                 RoomSelection::SmallStudio,
@@ -504,7 +571,7 @@ pub fn os_factor_label(f: OversamplingFactor) -> &'static str {
 }
 
 fn build_5e3_amp_topology_config() -> AmpTopologyConfig {
-    let mut config = AmpTopologyConfig::fender_5e3();
+    let mut config = AmpTopologyConfig::tweed_5e3();
     config.power_section.transformer_spec = OT_SPEC.into();
     config.power_supply.sag.rectifier_spec = Some(RECTIFIER_SPEC.into());
     config
@@ -604,7 +671,7 @@ fn build_v1_pair(
 // bypass + 3-terminal tone pot + grid conduction) is solved standalone and
 // its output fed to this stage — see `V2aGridNetwork` below. V2A→V2B is a
 // plain 0.02µF/1MΩ coupling cap.
-fn build_v2a_tube(engine_rate: EngineRate) -> TubeStage {
+pub fn build_v2a_tube(engine_rate: EngineRate) -> TubeStage {
     build_preamp_tube(
         engine_rate,
         V2A_SPECIMEN,
@@ -711,8 +778,8 @@ impl V2aGridNetwork {
     }
 }
 
-fn meter_ceiling_for_pair(pair: &SharedCathodeTriodePair, jack: &JackInput) -> f32 {
-    pair.voltage_cal().clean_ac_ceiling_volts() / jack.dc_gain()
+fn meter_ceiling_for_pair(pair: &SharedCathodeTriodePair, jack_dc_gain: f32) -> f32 {
+    pair.voltage_cal().clean_ac_ceiling_volts() / jack_dc_gain
 }
 
 // =============================================================================
@@ -739,6 +806,13 @@ pub struct TweedInner {
     pub grid_norm_handle: PotHandle,
     pub grid_bright_handle: PotHandle,
     pub grid_tone_handle: PotHandle,
+    /// The *other* tube's V2A grid network, held ready. The toggle changes
+    /// V1's plate source impedance, so there are exactly two possible
+    /// networks; both are built at construction and swapped on toggle —
+    /// the same shape `v1_pair_stock`/`v1_pair_mod` already uses. Building
+    /// one on the toggle would allocate an `MnaCircuit` inside `process`,
+    /// which the RT contract forbids and `assert_process_allocs` panics on.
+    pub grid_spare: V2aGridNetwork,
     // Ticked at host rate in `begin_host_sample`; targets set per-buffer.
     pub norm_smoother: PotSmoother,
     pub bright_smoother: PotSmoother,
@@ -747,13 +821,13 @@ pub struct TweedInner {
     pub coupling_v2a: CouplingCapacitor,
 
     pub amp_topology: AmpTopology,
-    pub preamp_tap: BPlusTap,
+    /// Rail reads and the per-buffer sag return for the caller-owned preamp
+    /// graph (V1 pair + V2A, all on the B+3 node).
+    pub supply: PreampSupply,
+    pub preamp_tap: PreampTap,
     pub power_tube_tap: BPlusTap,
 
     pub current_channel_mode: ChannelMode,
-
-    pub preamp_current_sum: f32,
-    pub preamp_current_count: u32,
 
     pub meter_this_host_sample: bool,
     pub v1_plate_sum: f32,
@@ -763,6 +837,21 @@ pub struct TweedInner {
 }
 
 impl TweedInner {
+    /// Exchange the live V2A grid network for the other tube's. The
+    /// incoming circuit is reset so a toggle starts from rest, matching the
+    /// freshly-built circuit this replaced; the caller re-applies the
+    /// current wiper positions afterwards.
+    pub fn swap_grid_network(&mut self) {
+        std::mem::swap(&mut self.grid_circuit, &mut self.grid_spare.circuit);
+        std::mem::swap(&mut self.grid_norm_handle, &mut self.grid_spare.norm_volume);
+        std::mem::swap(
+            &mut self.grid_bright_handle,
+            &mut self.grid_spare.bright_volume,
+        );
+        std::mem::swap(&mut self.grid_tone_handle, &mut self.grid_spare.tone);
+        self.grid_circuit.reset();
+    }
+
     fn reset_plate_meters(&mut self) {
         self.v1_plate_sum = 0.0;
         self.v2_plate_sum = 0.0;
@@ -773,15 +862,13 @@ impl TweedInner {
 
 impl InnerDspProcessor for TweedInner {
     fn begin_buffer(&mut self, n: usize) {
-        self.amp_topology.begin_buffer(n);
-        self.preamp_current_sum = 0.0;
-        self.preamp_current_count = 0;
+        self.supply.begin_buffer(&mut self.amp_topology, n);
         // Plate meters deliberately NOT reset here — they accumulate
         // across buffers until the metering window closes.
     }
 
     fn begin_host_sample(&mut self) {
-        self.amp_topology.advance_sample();
+        self.supply.begin_host_sample(&mut self.amp_topology);
         self.meter_this_host_sample = true;
 
         // Wiper values hold across OS sub-samples (zero-order hold).
@@ -794,7 +881,7 @@ impl InnerDspProcessor for TweedInner {
     }
 
     fn process_inner(&mut self, input: f32) -> f32 {
-        let b_plus_preamp = self.amp_topology.b_plus_at(self.preamp_tap);
+        let b_plus_preamp = self.supply.rail(&mut self.amp_topology, self.preamp_tap);
 
         // Split host input into per-triode feeds by channel mode.
         let v1a_input = if self.current_channel_mode != ChannelMode::Bright {
@@ -849,22 +936,20 @@ impl InnerDspProcessor for TweedInner {
             self.plate_samples_counted += 1;
         }
 
-        self.preamp_current_sum += v1_out.plate_a_current_amps
-            + v1_out.plate_b_current_amps
-            + self.v2a_tube.plate_current_amps();
-        self.preamp_current_count += 1;
+        // All three preamp triodes hang off the same B+3 node, so their
+        // currents sum into one drain.
+        self.supply.draw(
+            self.preamp_tap,
+            v1_out.plate_a_current_amps
+                + v1_out.plate_b_current_amps
+                + self.v2a_tube.plate_current_amps(),
+        );
 
         ot_volts
     }
 
     fn end_buffer(&mut self) {
-        let preamp_mean = if self.preamp_current_count > 0 {
-            self.preamp_current_sum / self.preamp_current_count as f32
-        } else {
-            0.0
-        };
-        self.amp_topology
-            .end_buffer(&[(self.preamp_tap, preamp_mean)]);
+        self.supply.end_buffer(&mut self.amp_topology);
     }
 
     fn reset(&mut self) {
@@ -874,144 +959,31 @@ impl InnerDspProcessor for TweedInner {
         self.v2a_tube.reset();
         self.coupling_v2a.reset();
         self.amp_topology.reset();
-        self.preamp_current_sum = 0.0;
-        self.preamp_current_count = 0;
         self.meter_this_host_sample = false;
         self.reset_plate_meters();
     }
 }
 
-// =============================================================================
-// TweedEngine — runtime-dispatched DspEngine over OS factor
-// =============================================================================
-
-// OS factor is a const-generic-style choice fixed at construction, so this
-// enum picks one `DspEngine<TweedInner, OS>` variant per supported factor.
-// Changing OS factor rebuilds the whole engine (see `initialize()`).
-pub enum TweedEngine {
-    X1(DspEngine<TweedInner, X1Boundary>),
-    X2(DspEngine<TweedInner, X2Boundary>),
-    X4(DspEngine<TweedInner, X4Boundary>),
-    X8(DspEngine<TweedInner, X8Boundary>),
-}
-
-impl TweedEngine {
-    pub fn new(engine_rate: EngineRate, inner: TweedInner) -> Self {
-        match engine_rate.oversampling {
-            OversamplingFactor::X1 => Self::X1(DspEngine::new(
-                engine_rate,
-                X1Boundary::new(engine_rate),
-                inner,
-            )),
-            OversamplingFactor::X2 => Self::X2(DspEngine::new(
-                engine_rate,
-                X2Boundary::new(engine_rate),
-                inner,
-            )),
-            OversamplingFactor::X4 => Self::X4(DspEngine::new(
-                engine_rate,
-                X4Boundary::new(engine_rate),
-                inner,
-            )),
-            OversamplingFactor::X8 => Self::X8(DspEngine::new(
-                engine_rate,
-                X8Boundary::new(engine_rate),
-                inner,
-            )),
-        }
-    }
-
-    #[inline]
-    pub fn engine_rate(&self) -> EngineRate {
-        match self {
-            Self::X1(e) => e.rate(),
-            Self::X2(e) => e.rate(),
-            Self::X4(e) => e.rate(),
-            Self::X8(e) => e.rate(),
-        }
-    }
-
-    #[inline]
-    pub fn begin_buffer(&mut self, n: usize) {
-        match self {
-            Self::X1(e) => e.begin_buffer(n),
-            Self::X2(e) => e.begin_buffer(n),
-            Self::X4(e) => e.begin_buffer(n),
-            Self::X8(e) => e.begin_buffer(n),
-        }
-    }
-
-    #[inline]
-    pub fn process_sample(&mut self, input: f32) -> f32 {
-        match self {
-            Self::X1(e) => e.process_sample(input),
-            Self::X2(e) => e.process_sample(input),
-            Self::X4(e) => e.process_sample(input),
-            Self::X8(e) => e.process_sample(input),
-        }
-    }
-
-    #[inline]
-    pub fn end_buffer(&mut self) {
-        match self {
-            Self::X1(e) => e.end_buffer(),
-            Self::X2(e) => e.end_buffer(),
-            Self::X4(e) => e.end_buffer(),
-            Self::X8(e) => e.end_buffer(),
-        }
-    }
-
-    #[inline]
-    pub fn reset(&mut self) {
-        match self {
-            Self::X1(e) => e.reset(),
-            Self::X2(e) => e.reset(),
-            Self::X4(e) => e.reset(),
-            Self::X8(e) => e.reset(),
-        }
-    }
-
-    #[inline]
-    pub fn inner(&self) -> &TweedInner {
-        match self {
-            Self::X1(e) => e.inner(),
-            Self::X2(e) => e.inner(),
-            Self::X4(e) => e.inner(),
-            Self::X8(e) => e.inner(),
-        }
-    }
-
-    #[inline]
-    pub fn inner_mut(&mut self) -> &mut TweedInner {
-        match self {
-            Self::X1(e) => e.inner_mut(),
-            Self::X2(e) => e.inner_mut(),
-            Self::X4(e) => e.inner_mut(),
-            Self::X8(e) => e.inner_mut(),
-        }
-    }
-}
-
-// =============================================================================
-// AudioState — sample-rate / block-size dependent runtime state
-// =============================================================================
-
-// Runtime state whose construction depends on the host's sample rate or
-// max buffer size. Built lazily in `Plugin::initialize`; `None` before then.
 pub struct AudioState {
     pub engine_rate: EngineRate,
-    pub engine: TweedEngine,
+    pub engine: AnyDspEngine<TweedInner>,
 
-    pub dc_blocker_output: DCBlocker,
-    pub input_meter: InputLevelMeter,
+    /// Entry and exit boundary, owned whole: input meter (raw sample) →
+    /// calibration → jack divider on the way in; output trim + NaN/Inf guard
+    /// → host-rate DC blockers on the way out. Also the only route to
+    /// [`AmpIo::output_health`], which a hand-composed exit cannot see.
+    pub amp_io: AmpIo,
 
-    pub ir_convolver: ir_convolver::HotSwapConvolver,
-    pub pre_ir_buffer: Vec<f32>,
-    pub post_ir_buffer: Vec<f32>,
+    /// Both arms stay resident and the active one is fed, so a mode switch is
+    /// instant rather than a rebuild (contract §4).
+    pub cab_dynamic: CabBackEnd,
+    pub cab_ir: CabBackEnd,
+
+    pub pre_cab_buffer: Vec<f32>,
+    pub post_cab_left: Vec<f32>,
+    pub post_cab_right: Vec<f32>,
     pub ir_block_size: usize,
     pub ir_crossfade_samples: usize,
-
-    pub cab_processor: SpeakerCabRoomProcessor,
 
     pub meter_window_len: usize,
     pub meter_window_samples: usize,
@@ -1025,17 +997,24 @@ impl AudioState {
         os_factor: OversamplingFactor,
         params: &TheTweedParams,
         volume_taper: &PotTaperConfig,
-        input_cal: &InputCalibration,
-        jack_input: &JackInput,
+        input_trim_db: f32,
     ) -> Self {
         let engine_rate = EngineRate::new(sample_rate, os_factor);
+
+        // The entry pieces are constructed here and handed to `AmpIo`, which
+        // owns them from then on — there is no plugin-side copy to drift.
+        let mut input_cal = InputCalibration::amp_standard();
+        input_cal.set_user_trim_db(input_trim_db);
+        let jack_input = JackInput::new(JACK_SERIES_OHMS, JACK_GRID_LEAK_OHMS);
 
         let v1_pair_stock = build_v1_pair(engine_rate, V1_STOCK_SPECIMEN, V1_STOCK_BIAS_V);
         let v1_pair_mod = build_v1_pair(engine_rate, V1_MOD_SPECIMEN, V1_MOD_BIAS_V);
 
         let amp_topology =
             AmpTopology::new(engine_rate, build_5e3_amp_topology_config());
-        let preamp_tap = amp_topology.b_plus_tap("preamp");
+        let supply = PreampSupply::new(&amp_topology, &["preamp"])
+            .expect("the 5E3 filter chain publishes a 'preamp' rail");
+        let preamp_tap = supply.tap("preamp");
         let power_tube_tap = amp_topology.b_plus_tap("power_tube");
 
         // V1 tube choice sets the plate source-Z baked into the V2A grid
@@ -1054,6 +1033,16 @@ impl AudioState {
         } = V2aGridNetwork::new(
             engine_rate,
             v1_source_z,
+            v2a_tube.lut_quiescent_bias_volts(),
+        );
+
+        // The toggle's only effect on this network is V1's plate source
+        // impedance, so the alternate is built here rather than on the
+        // audio thread when the user flips the switch.
+        let spare_specimen = if tube_toggle { V1_STOCK_SPECIMEN } else { V1_MOD_SPECIMEN };
+        let grid_spare = V2aGridNetwork::new(
+            engine_rate,
+            plate_source_impedance(spare_specimen),
             v2a_tube.lut_quiescent_bias_volts(),
         );
 
@@ -1081,40 +1070,55 @@ impl AudioState {
             grid_norm_handle: norm_volume,
             grid_bright_handle: bright_volume,
             grid_tone_handle: tone,
+            grid_spare,
             norm_smoother: PotSmoother::new(sample_rate, init_norm, POT_SMOOTH_TAU_S),
             bright_smoother: PotSmoother::new(sample_rate, init_bright, POT_SMOOTH_TAU_S),
             tone_smoother: PotSmoother::new(sample_rate, init_tone, POT_SMOOTH_TAU_S),
             coupling_v2a,
             amp_topology,
+            supply,
             preamp_tap,
             power_tube_tap,
             current_channel_mode: params.channel_select.value(),
-            preamp_current_sum: 0.0,
-            preamp_current_count: 0,
             meter_this_host_sample: false,
             v1_plate_sum: 0.0,
             v2_plate_sum: 0.0,
             v3v4_plate_sum: 0.0,
             plate_samples_counted: 0,
         };
-        let engine = TweedEngine::new(engine_rate, inner);
+        let engine = AnyDspEngine::new(engine_rate, inner);
 
         let meter_ceiling = {
             let inner = engine.inner();
             let pair = if tube_toggle { &inner.v1_pair_mod } else { &inner.v1_pair_stock };
-            meter_ceiling_for_pair(pair, jack_input)
+            meter_ceiling_for_pair(pair, jack_input.dc_gain())
         };
         let input_meter =
             InputLevelMeter::new(sample_rate, input_cal.input_scale(), meter_ceiling);
 
-        let ir_convolver = ir_convolver::HotSwapConvolver::new(&[1.0], max_buffer_size, 1);
-        let pre_ir_buffer = vec![0.0; max_buffer_size];
-        let post_ir_buffer = vec![0.0; max_buffer_size];
+        // `AmpIo::new` takes `host_sr` and keys its exit DC blockers through
+        // `DCBlocker::host_rate` internally — they sit after the boundary
+        // downsample, so an amp-domain rate would shift the 10 Hz corner by
+        // the OS factor (contract §5a).
+        let mut amp_io = AmpIo::new(
+            sample_rate,
+            input_cal,
+            jack_input,
+            input_meter,
+            OUTPUT_DC_BLOCK_HZ,
+        );
+        amp_io.set_output_trim_db(params.output_trim_db.value());
+
         let ir_crossfade_samples = (IR_CROSSFADE_MS * sample_rate / 1000.0) as usize;
 
-        let dc_blocker_output = DCBlocker::new(engine_rate, 10.0);
-
-        let cab_processor = build_cab_processor(
+        // Both arms resident from construction. The `Ir` arm carries its own
+        // loadbox and the `Dynamic` arm structurally cannot have one, which
+        // is the level-pairing invariant that used to live in a comment.
+        let cab_ir = CabBackEnd::Ir {
+            convolver: Box::new(HotSwapConvolver::new(&[1.0], max_buffer_size, 1)),
+            loadbox: LoadboxDi::standard(),
+        };
+        let cab_dynamic = build_cab_arm(
             sample_rate,
             max_buffer_size,
             DEFAULT_SPEAKER_ID,
@@ -1137,42 +1141,35 @@ impl AudioState {
         Self {
             engine_rate,
             engine,
-            dc_blocker_output,
-            input_meter,
-            ir_convolver,
-            pre_ir_buffer,
-            post_ir_buffer,
+            amp_io,
+            cab_dynamic,
+            cab_ir,
+            pre_cab_buffer: vec![0.0; max_buffer_size],
+            post_cab_left: vec![0.0; max_buffer_size],
+            post_cab_right: vec![0.0; max_buffer_size],
             ir_block_size: max_buffer_size,
             ir_crossfade_samples,
-            cab_processor,
             meter_window_len,
             meter_window_samples: 0,
             meter_output_peak: 0.0,
         }
     }
+
 }
 
 // =============================================================================
-// TheTweed — Fender Deluxe 5E3 Plugin
+// The Tweed 5E3 Plugin
 // =============================================================================
 
 pub struct TheTweed {
     params: Arc<TheTweedParams>,
 
-    input_cal: InputCalibration,
-    jack_input: JackInput,
-
     // 5E3 volume pots are 1MΩ Audio 30A taper.
     volume_taper: PotTaperConfig,
 
-    // Post-cab master level. Not part of the 5E3 circuit (a real 5E3 has
-    // no master volume)
-    master_pot: MasterVolume,
-
-    // Output-transduction boundary: OT secondary volts -> -10dB loadbox
-    // pad -> +24dBu-at-FS converter (IR arm only).
-    loadbox_di: LoadboxDi,
-
+    // The entry/exit boundary and the loadbox live inside `AudioState` now —
+    // `AmpIo` owns the calibration, jack and meter, and the `Ir` cab arm owns
+    // its `LoadboxDi`. Nothing here mirrors them.
     ir_load_state: Arc<IrLoadState>,
 
     // Hot-swap slot for the parametric cab chain, populated by the GUI.
@@ -1193,6 +1190,10 @@ pub struct TheTweed {
     meter_v2_volts: Arc<atomic_float::AtomicF32>,
     meter_v3v4_volts: Arc<atomic_float::AtomicF32>,
     meter_output_db: Arc<atomic_float::AtomicF32>,
+    // Sticky: set when `AmpIo::output_health` reports a latched run, i.e. an
+    // interior integrator has gone non-finite and the amp is silent until
+    // rebuilt. Only reachable because `AmpIo` owns the exit boundary.
+    meter_output_latched: Arc<atomic::AtomicBool>,
     // 0 = not yet initialized; GUI falls back to X4 display.
     meter_os_ratio: Arc<atomic::AtomicU8>,
 }
@@ -1202,14 +1203,7 @@ impl Default for TheTweed {
         Self {
             params: Arc::new(TheTweedParams::default()),
 
-            input_cal: InputCalibration::amp_standard(),
-            jack_input: JackInput::new(68_000.0, 1_000_000.0),
-
             volume_taper: PotTaperConfig::new(PotTaper::Audio30A),
-
-            master_pot: MasterVolume::power_master(),
-
-            loadbox_di: LoadboxDi::standard(),
 
             ir_load_state: Arc::new(IrLoadState::new()),
 
@@ -1230,6 +1224,7 @@ impl Default for TheTweed {
             meter_v2_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
             meter_v3v4_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
             meter_output_db: Arc::new(atomic_float::AtomicF32::new(-120.0)),
+            meter_output_latched: Arc::new(atomic::AtomicBool::new(false)),
             // 0 = "not yet initialized"; GUI falls back to X4 display.
             meter_os_ratio: Arc::new(atomic::AtomicU8::new(0)),
         }
@@ -1254,9 +1249,9 @@ impl TheTweed {
         max_buffer_size: usize,
         os_factor: OversamplingFactor,
     ) {
-        // Trim must be live in `input_cal` before `AudioState::build` reads it.
+        // `AudioState::build` applies the trim to the calibration it hands to
+        // `AmpIo`, so the meter's scale is correct on the first buffer.
         let trim_db = self.params.input_trim_db.value();
-        self.input_cal.set_user_trim_db(trim_db);
         self.cached_input_trim_db = trim_db;
 
         let audio_state = AudioState::build(
@@ -1265,8 +1260,7 @@ impl TheTweed {
             os_factor,
             &self.params,
             &self.volume_taper,
-            &self.input_cal,
-            &self.jack_input,
+            trim_db,
         );
 
         self.meter_os_ratio.store(
@@ -1285,9 +1279,14 @@ impl Plugin for TheTweed {
     const EMAIL: &'static str = env!("CARGO_PKG_AUTHORS");
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
+    // Mono in, stereo out. The amp is a single-ended electrical path, but the
+    // acoustic chain is natively stereo — two mic branches, balance-law pan,
+    // and a room whose late tail is deliberately decorrelated — so collapsing
+    // it to mono discards the engine's own output. There is deliberately no
+    // mono path in the engine (SDK-D11) and one will not be added.
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
         main_input_channels: NonZeroU32::new(1),
-        main_output_channels: NonZeroU32::new(1),
+        main_output_channels: NonZeroU32::new(2),
         ..AudioIOLayout::const_default()
     }];
 
@@ -1313,7 +1312,6 @@ impl Plugin for TheTweed {
         self.params.bright_volume.smoothed.reset(self.params.bright_volume.value());
         self.params.normal_volume.smoothed.reset(self.params.normal_volume.value());
         self.params.tone.smoothed.reset(self.params.tone.value());
-        self.params.master.smoothed.reset(self.params.master.value());
 
         let os_factor = self
             .params
@@ -1359,16 +1357,19 @@ impl Plugin for TheTweed {
         self.params.bright_volume.smoothed.reset(self.params.bright_volume.value());
         self.params.normal_volume.smoothed.reset(self.params.normal_volume.value());
         self.params.tone.smoothed.reset(self.params.tone.value());
-        self.params.master.smoothed.reset(self.params.master.value());
-        self.jack_input.reset();
         if let Some(audio) = self.audio_state.as_mut() {
             audio.engine.reset();
-            audio.ir_convolver.reset();
-            audio.cab_processor.reset();
-            audio.pre_ir_buffer.fill(0.0);
-            audio.post_ir_buffer.fill(0.0);
-            audio.dc_blocker_output.reset();
-            audio.input_meter.reset();
+            // Both arms reset: the inactive one must not resume with stale
+            // convolution or speaker state when the mode is switched back.
+            audio.cab_ir.reset();
+            audio.cab_dynamic.reset();
+            audio.pre_cab_buffer.fill(0.0);
+            audio.post_cab_left.fill(0.0);
+            audio.post_cab_right.fill(0.0);
+            // Resets the input meter and the exit DC blockers; calibration
+            // and trim settings are deliberately untouched.
+            audio.amp_io.reset();
+            audio.amp_io.reset_output_health();
             audio.meter_window_samples = 0;
             audio.meter_output_peak = 0.0;
         }
@@ -1389,28 +1390,33 @@ impl Plugin for TheTweed {
             .as_mut()
             .expect("Plugin::process called before successful Plugin::initialize");
 
+        let crossfade = audio.ir_crossfade_samples;
         if let Ok(mut pending) = self.ir_load_state.pending.try_lock() {
             if let Some(new_conv) = pending.take() {
-                audio.ir_convolver.queue_swap(new_conv, audio.ir_crossfade_samples);
+                if let Some(convolver) = audio.cab_ir.convolver_mut() {
+                    convolver.queue_swap(new_conv, crossfade);
+                }
             }
         }
 
-        // try_lock so the audio thread never blocks on a GUI-side build.
+        // try_lock so the audio thread never blocks on a GUI-side build. The
+        // arm arrives fully assembled, so this is a move, not an allocation.
         if let Ok(mut pending) = self.cab_load_state.pending.try_lock() {
-            if let Some(new_processor) = pending.take() {
-                audio.cab_processor = new_processor;
+            if let Some(new_arm) = pending.take() {
+                audio.cab_dynamic = new_arm;
             }
         }
 
         let num_samples = buffer.samples();
         let power_on = self.params.power.value();
-        let mut sample_idx = 0usize;
 
         let current_trim_db = self.params.input_trim_db.value();
         if (current_trim_db - self.cached_input_trim_db).abs() > 0.01 {
             self.cached_input_trim_db = current_trim_db;
-            self.input_cal.set_user_trim_db(current_trim_db);
-            audio.input_meter.set_input_scale(self.input_cal.input_scale());
+            // Moves the calibration and the meter's scale together — the
+            // meter converts raw magnitudes with `input_scale` only at
+            // read time, so the two cannot be updated separately.
+            audio.amp_io.set_input_trim_db(current_trim_db);
         }
 
         let cab_mode = self.params.cab_modelling_mode.value();
@@ -1421,29 +1427,23 @@ impl Plugin for TheTweed {
         {
             self.cached_mic_x_position = mic_x;
             self.cached_mic_distance_inches = mic_dist_in;
-            audio.cab_processor.set_mic_placement(MicrophonePlacement {
-                distance_m: mic_dist_in * 0.0254,
-                radial_offset_cm: mic_x.radial_offset_cm(),
-                off_axis_angle_deg: 0.0,
-            });
+            // Placement is a live, alloc-free setter on the Dynamic arm;
+            // only identity changes (mic, speaker, cabinet, room) rebuild.
+            if let Some(chain) = audio.cab_dynamic.dynamic_mut() {
+                chain.set_mic_placement(MicChannel::Primary, MicrophonePlacement {
+                    distance_m: mic_dist_in * 0.0254,
+                    radial_offset_cm: mic_x.radial_offset_cm(),
+                    off_axis_angle_deg: 0.0,
+                });
+            }
         }
 
-        // Tube swap changes V1's plate source-Z, so rebuild the V2A grid
-        // network on toggle and snap it to the current pot settings.
+        // Tube swap changes V1's plate source-Z, so the V2A grid network
+        // changes with it. Both networks are resident: swap, don't build —
+        // constructing an MnaCircuit here would allocate on the audio thread.
         let current_tube_toggle = self.params.tube_toggle.value();
         if current_tube_toggle != audio.engine.inner().current_tube_toggle {
-            let v1_specimen =
-                if current_tube_toggle { V1_MOD_SPECIMEN } else { V1_STOCK_SPECIMEN };
-            let v1_source_z = plate_source_impedance(v1_specimen);
-            // V2A's Q is a property of its own MLUT — unchanged by the V1
-            // toggle; read it back from the existing stage.
-            let v2a_q = audio.engine.inner().v2a_tube.lut_quiescent_bias_volts();
-            let V2aGridNetwork {
-                circuit,
-                norm_volume,
-                bright_volume,
-                tone,
-            } = V2aGridNetwork::new(audio.engine_rate, v1_source_z, v2a_q);
+            audio.engine.inner_mut().swap_grid_network();
 
             let normal_wiper = self
                 .volume_taper
@@ -1454,18 +1454,22 @@ impl Plugin for TheTweed {
             let tone_pos = self.params.tone.value();
 
             let inner = audio.engine.inner_mut();
-            inner.grid_circuit = circuit;
-            inner.grid_norm_handle = norm_volume;
-            inner.grid_bright_handle = bright_volume;
-            inner.grid_tone_handle = tone;
             inner.current_tube_toggle = current_tube_toggle;
             inner.norm_smoother.set_target(normal_wiper);
             inner.bright_smoother.set_target(bright_wiper);
             inner.tone_smoother.set_target(tone_pos);
-            inner.grid_circuit.set_pot_position(norm_volume, normal_wiper);
-            inner.grid_circuit.set_pot_position(bright_volume, bright_wiper);
-            inner.grid_circuit.set_pot_position(tone, tone_pos);
+            // Snap the incoming network's wipers so the swap does not ramp
+            // from the netlist default.
+            let (n, b, t) = (
+                inner.grid_norm_handle,
+                inner.grid_bright_handle,
+                inner.grid_tone_handle,
+            );
+            inner.grid_circuit.set_pot_position(n, normal_wiper);
+            inner.grid_circuit.set_pot_position(b, bright_wiper);
+            inner.grid_circuit.set_pot_position(t, tone_pos);
 
+            let jack_dc_gain = audio.amp_io.jack_mut().dc_gain();
             let ceiling = {
                 let inner = audio.engine.inner();
                 let v1_pair = if current_tube_toggle {
@@ -1473,9 +1477,9 @@ impl Plugin for TheTweed {
                 } else {
                     &inner.v1_pair_stock
                 };
-                meter_ceiling_for_pair(v1_pair, &self.jack_input)
+                meter_ceiling_for_pair(v1_pair, jack_dc_gain)
             };
-            audio.input_meter.set_clean_ceiling_v(ceiling);
+            audio.amp_io.input_meter_mut().set_clean_ceiling_v(ceiling);
         }
 
         {
@@ -1496,92 +1500,135 @@ impl Plugin for TheTweed {
 
         audio.engine.begin_buffer(num_samples);
 
-        // Pass 1 — per-sample signal chain.
-        for channel_samples in buffer.iter_samples() {
-            for sample in channel_samples {
-                if !power_on {
-                    audio.pre_ir_buffer[sample_idx] = 0.0;
-                    sample_idx += 1;
-                    continue;
-                }
+        // The output trim is a per-buffer control, not a per-sample one: it
+        // lives inside `AmpIo`'s exit chain and there is no audible artefact
+        // from stepping it once per block.
+        audio.amp_io.set_output_trim_db(self.params.output_trim_db.value());
 
-                let input = *sample;
+        // Disjoint field borrows: the three passes need the boundary, the
+        // engine, one cab arm and the scratch buffers simultaneously, and
+        // selecting the arm through a method would borrow all of `audio`.
+        let output_peak = {
+            let AudioState {
+                engine,
+                amp_io,
+                cab_dynamic,
+                cab_ir,
+                pre_cab_buffer,
+                post_cab_left,
+                post_cab_right,
+                ir_block_size,
+                ..
+            } = &mut *audio;
 
-                // Meter reads the raw DAW signal, before calibration.
-                audio.input_meter.process(input);
+            // Selected once. Both arms stay resident, so this is a pick, not
+            // a rebuild — and the transduction pairing rides on the arm.
+            let active_cab: &mut CabBackEnd = match cab_mode {
+                CabModellingMode::Ir => cab_ir,
+                CabModellingMode::Dynamic => cab_dynamic,
+            };
+            let ir_block_size = *ir_block_size;
 
-                let conditioned =
-                    self.jack_input.process(self.input_cal.process(input));
-
-                // Boundary OS: inner DSP fires OS_factor times per host sample.
-                let ot_volts = audio.engine.process_sample(conditioned);
-
-                // IR mode: loadbox DI converts OT secondary volts to samples.
-                // Dynamic mode: SpeakerCabRoomProcessor's own mic preamp
-                // performs the transduction, so pass raw volts through.
-                audio.pre_ir_buffer[sample_idx] = match cab_mode {
-                    CabModellingMode::Ir => self.loadbox_di.process(ot_volts),
-                    CabModellingMode::Dynamic => ot_volts,
-                };
-                sample_idx += 1;
-            }
-        }
-
-        audio.engine.end_buffer();
-
-        // Pass 2 — cab modelling.
-        let ir_block_size = audio.ir_block_size;
-        match cab_mode {
-            CabModellingMode::Ir => {
-                for i in num_samples..ir_block_size {
-                    audio.pre_ir_buffer[i] = 0.0;
-                }
-                audio.ir_convolver.process(
-                    &audio.pre_ir_buffer[..ir_block_size],
-                    &mut audio.post_ir_buffer[..ir_block_size],
-                );
-            }
-            CabModellingMode::Dynamic => {
+            // Pass 1 — per host sample. Mono in: the input is channel 0, and
+            // the output channels are not written until pass 3, so reading
+            // here cannot alias what we later overwrite.
+            if power_on {
+                let input_channel = &buffer.as_slice()[0];
                 for i in 0..num_samples {
-                    // b_plus_sag: 1.0 (no-op) — sag is already applied upstream.
-                    let (l, r) =
-                        audio.cab_processor.process(audio.pre_ir_buffer[i], 1.0);
-                    audio.post_ir_buffer[i] = 0.5 * (l + r);
+                    // Entry boundary: meters the raw DAW sample, then
+                    // calibration → jack divider → grid volts.
+                    let grid_volts = amp_io.process_input(input_channel[i]);
+
+                    // Boundary OS: inner DSP fires OS_factor times per host
+                    // sample and returns OT-secondary volts.
+                    let ot_volts = engine.process_sample(grid_volts);
+
+                    // The arm's own transduction: `Ir` applies its loadbox
+                    // (volts → samples), `Dynamic` passes volts through and
+                    // transduces inside `process_block`.
+                    pre_cab_buffer[i] = active_cab.route_sample(ot_volts);
                 }
+            } else {
+                pre_cab_buffer[..num_samples].fill(0.0);
             }
-        }
 
-        // Pass 3 — output trim, master gain, DC block.
-        let mut output_peak = 0.0f32;
-        {
-            let output_channel = &mut buffer.as_slice()[0];
-            for i in 0..num_samples {
-                if !power_on {
-                    output_channel[i] = 0.0;
-                    continue;
+            engine.end_buffer();
+
+            // Pass 2 — cab domain, host rate, stereo out.
+            //
+            // b_plus_sag = 1.0: sag is already embodied in the OT volts.
+            //
+            // The IR arm's convolver has a fixed block size, so a shorter
+            // host buffer is zero-padded to it. That desynchronises the
+            // convolution stream rather than degrading gracefully, and it is
+            // recorded as an engine responsibility — SDK-D13:
+            // `ZeroLatencyConvolver` should buffer internally. Remove this
+            // padding when the engine lands that fix; do not make it
+            // permanent.
+            let block = match cab_mode {
+                CabModellingMode::Ir => {
+                    if num_samples < ir_block_size {
+                        pre_cab_buffer[num_samples..ir_block_size].fill(0.0);
+                    }
+                    ir_block_size
                 }
+                CabModellingMode::Dynamic => num_samples,
+            };
+            active_cab.process_block(
+                &pre_cab_buffer[..block],
+                &mut post_cab_left[..block],
+                &mut post_cab_right[..block],
+                1.0,
+            );
 
-                let mut signal = audio.post_ir_buffer[i];
-
-                let output_trim = self.params.output_trim_db.smoothed.next();
-                signal *= thermionicdsp::db_to_linear(output_trim);
-
-                let master = self.params.master.smoothed.next();
-                self.master_pot.set_position(master);
-                signal *= self.master_pot.attenuation();
-
-                signal = audio.dc_blocker_output.process(signal);
-
-                output_peak = output_peak.max(signal.abs());
-                output_channel[i] = signal;
+            // Pass 3 — exit boundary, in place over the host buffer.
+            let n = num_samples;
+            let slice = buffer.as_slice();
+            if !power_on {
+                for channel in slice.iter_mut() {
+                    channel[..n].fill(0.0);
+                }
+                0.0
+            } else if slice.len() >= 2 {
+                let (left_part, right_part) = slice.split_at_mut(1);
+                let left = &mut left_part[0][..n];
+                let right = &mut right_part[0][..n];
+                left.copy_from_slice(&post_cab_left[..n]);
+                right.copy_from_slice(&post_cab_right[..n]);
+                // Output trim + NaN/Inf guard, then the host-rate DC
+                // blockers; returns the block peak for the output meter.
+                amp_io.process_output_block(left, right)
+            } else {
+                // A host that ignored the negotiated stereo layout. Publish
+                // the left channel, but still run the right through the exit
+                // chain so the two DC blockers' states cannot diverge —
+                // `post_cab_right` is regenerated every buffer, so using it
+                // as the sink allocates nothing.
+                let left = &mut slice[0][..n];
+                left.copy_from_slice(&post_cab_left[..n]);
+                amp_io.process_output_block(left, &mut post_cab_right[..n])
             }
+        };
+
+        // Numerical health, once per buffer and off the hot loop (contract
+        // §5). A run that keeps growing across buffers means an interior
+        // integrator has latched and the amp is silent until rebuilt; the
+        // exit guard has already stopped it reaching the host.
+        let health = audio.amp_io.output_health();
+        if health.run_length > LATCHED_SAMPLES {
+            // The sanctioned remedy is an off-thread rebuild swapped in here.
+            // Not yet wired (`BackgroundTask` is unused), so this publishes
+            // the condition for the GUI and clears the counters so a later
+            // occurrence is distinguishable from the one already reported.
+            self.meter_output_latched.store(true, atomic::Ordering::Relaxed);
+            audio.amp_io.reset_output_health();
         }
 
         // Publish meters
         audio.meter_output_peak = audio.meter_output_peak.max(output_peak);
         audio.meter_window_samples += num_samples;
         if audio.meter_window_samples >= audio.meter_window_len {
-            let metrics = audio.input_meter.get_metrics();
+            let metrics = audio.amp_io.input_metrics();
             self.meter_peak_volts.store(metrics.peak_volts, atomic::Ordering::Relaxed);
 
             if power_on {
@@ -1677,7 +1724,10 @@ nih_export_vst3!(TheTweed);
 #[cfg(test)]
 mod decay_buzz_probe {
     use super::*;
-    use thermionicdsp::BiquadFilter;
+    use thermionicdsp::circuit::BiquadFilter;
+    // The probes instantiate concrete boundaries directly to compare OS
+    // factors; the plugin's own path is the `AnyDspEngine` runtime dispatch.
+    use thermionicdsp::{DspEngine, X4Boundary, X8Boundary};
 
     const SR: f32 = 48_000.0;
     const BLOCK: usize = 256;
@@ -1719,25 +1769,46 @@ mod decay_buzz_probe {
         data
     }
 
-    fn write_wav_f32(path: &std::path::Path, x: &[f32]) {
-        let n = x.len() as u32;
-        let mut b = Vec::with_capacity(44 + 4 * x.len());
+    /// `x` is interleaved by `channels`. The probes render the plugin's real
+    /// stereo output, so they write stereo files — collapsing to mono here
+    /// would hide exactly the mic-pan and decorrelated-room-tail content the
+    /// acoustic chain produces.
+    fn write_wav_f32(path: &std::path::Path, x: &[f32], channels: u16) {
+        let frames = (x.len() / channels as usize) as u32;
+        let block_align = 4 * u32::from(channels);
+        let data_bytes = block_align * frames;
+        let mut b = Vec::with_capacity(44 + data_bytes as usize);
         b.extend_from_slice(b"RIFF");
-        b.extend_from_slice(&(36 + 4 * n).to_le_bytes());
+        b.extend_from_slice(&(36 + data_bytes).to_le_bytes());
         b.extend_from_slice(b"WAVEfmt ");
         b.extend_from_slice(&16u32.to_le_bytes());
         b.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
-        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&channels.to_le_bytes());
         b.extend_from_slice(&48_000u32.to_le_bytes());
-        b.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
-        b.extend_from_slice(&4u16.to_le_bytes());
+        b.extend_from_slice(&(48_000 * block_align).to_le_bytes());
+        b.extend_from_slice(&(block_align as u16).to_le_bytes());
         b.extend_from_slice(&32u16.to_le_bytes());
         b.extend_from_slice(b"data");
-        b.extend_from_slice(&(4 * n).to_le_bytes());
+        b.extend_from_slice(&data_bytes.to_le_bytes());
         for &v in x {
             b.extend_from_slice(&v.to_le_bytes());
         }
         std::fs::write(path, b).expect("write WAV");
+    }
+
+    /// Interleave a stereo pair, normalised to `peak_target` of full scale
+    /// across BOTH channels so the balance between them is preserved.
+    fn interleave_normalised(l: &[f32], r: &[f32], peak_target: f32) -> Vec<f32> {
+        let peak = l
+            .iter()
+            .chain(r.iter())
+            .fold(0.0f32, |m, &v| m.max(v.abs()))
+            .max(1e-9);
+        let g = peak_target / peak;
+        l.iter()
+            .zip(r.iter())
+            .flat_map(|(&a, &b)| [a * g, b * g])
+            .collect()
     }
 
     /// Mirror of `AudioState::build` at the reported knob settings.
@@ -1751,7 +1822,9 @@ mod decay_buzz_probe {
         let v1_pair_stock = build_v1_pair(RATE, V1_STOCK_SPECIMEN, V1_STOCK_BIAS_V);
         let v1_pair_mod = build_v1_pair(RATE, V1_MOD_SPECIMEN, V1_MOD_BIAS_V);
         let amp_topology = AmpTopology::new(RATE, build_5e3_amp_topology_config());
-        let preamp_tap = amp_topology.b_plus_tap("preamp");
+        let supply = PreampSupply::new(&amp_topology, &["preamp"])
+            .expect("the 5E3 filter chain publishes a 'preamp' rail");
+        let preamp_tap = supply.tap("preamp");
         let power_tube_tap = amp_topology.b_plus_tap("power_tube");
         let v1_source_z = plate_source_impedance(V1_STOCK_SPECIMEN);
         let v2a_tube = build_v2a_tube(RATE);
@@ -1761,6 +1834,11 @@ mod decay_buzz_probe {
             bright_volume,
             tone,
         } = V2aGridNetwork::new(RATE, v1_source_z, v2a_tube.lut_quiescent_bias_volts());
+        let grid_spare = V2aGridNetwork::new(
+            RATE,
+            plate_source_impedance(V1_STOCK_SPECIMEN),
+            v2a_tube.lut_quiescent_bias_volts(),
+        );
         circuit.set_pot_position(norm_volume, init_norm);
         circuit.set_pot_position(bright_volume, init_bright);
         circuit.set_pot_position(tone, init_tone);
@@ -1774,6 +1852,7 @@ mod decay_buzz_probe {
             grid_norm_handle: norm_volume,
             grid_bright_handle: bright_volume,
             grid_tone_handle: tone,
+            grid_spare,
             norm_smoother: PotSmoother::new(SR, init_norm, POT_SMOOTH_TAU_S),
             bright_smoother: PotSmoother::new(SR, init_bright, POT_SMOOTH_TAU_S),
             tone_smoother: PotSmoother::new(SR, init_tone, POT_SMOOTH_TAU_S),
@@ -1783,11 +1862,10 @@ mod decay_buzz_probe {
                 V2B_GRID_LEAK_OHMS,
             ),
             amp_topology,
+            supply,
             preamp_tap,
             power_tube_tap,
             current_channel_mode: ChannelMode::Bright,
-            preamp_current_sum: 0.0,
-            preamp_current_count: 0,
             meter_this_host_sample: false,
             v1_plate_sum: 0.0,
             v2_plate_sum: 0.0,
@@ -1938,12 +2016,13 @@ mod decay_buzz_probe {
 
     /// Render the playtest chain. `dynamic_clamp` updates the grid network's
     /// conduction clamp from V2A's live absolute cathode once per host sample.
-    /// Returns (ot, mic, per-window (fizz, conduction µA·s, cathode V)).
+    /// Returns (ot, mic_l, mic_r, per-window (fizz, conduction µA·s, cathode
+    /// V)). The mic render is stereo — the cab chain's real output.
     fn render_playtest(
         di: &[f32],
         os: OversamplingFactor,
         dynamic_clamp: bool,
-    ) -> (Vec<f32>, Vec<f32>, Vec<(f32, f32, f32)>) {
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<(f32, f32, f32)>) {
         let rate = EngineRate::new(SR, os);
         let peak = di.iter().fold(0.0f32, |m, &x| m.max(x.abs())).max(1e-9);
         let g = 10f32.powf(-12.0 / 20.0) / peak;
@@ -1959,7 +2038,9 @@ mod decay_buzz_probe {
             let v1_pair_stock = build_v1_pair(rate, V1_STOCK_SPECIMEN, V1_STOCK_BIAS_V);
             let v1_pair_mod = build_v1_pair(rate, V1_MOD_SPECIMEN, V1_MOD_BIAS_V);
             let amp_topology = AmpTopology::new(rate, build_5e3_amp_topology_config());
-            let preamp_tap = amp_topology.b_plus_tap("preamp");
+            let supply = PreampSupply::new(&amp_topology, &["preamp"])
+            .expect("the 5E3 filter chain publishes a 'preamp' rail");
+        let preamp_tap = supply.tap("preamp");
             let power_tube_tap = amp_topology.b_plus_tap("power_tube");
             let v1_source_z = plate_source_impedance(V1_STOCK_SPECIMEN);
             let v2a_tube = build_v2a_tube(rate);
@@ -1969,6 +2050,11 @@ mod decay_buzz_probe {
                 bright_volume,
                 tone,
             } = V2aGridNetwork::new(rate, v1_source_z, v2a_tube.lut_quiescent_bias_volts());
+            let grid_spare = V2aGridNetwork::new(
+                rate,
+                plate_source_impedance(V1_STOCK_SPECIMEN),
+                v2a_tube.lut_quiescent_bias_volts(),
+            );
             circuit.set_pot_position(norm_volume, init_norm);
             circuit.set_pot_position(bright_volume, init_bright);
             circuit.set_pot_position(tone, init_tone);
@@ -1981,6 +2067,7 @@ mod decay_buzz_probe {
                 grid_norm_handle: norm_volume,
                 grid_bright_handle: bright_volume,
                 grid_tone_handle: tone,
+                grid_spare,
                 norm_smoother: PotSmoother::new(SR, init_norm, POT_SMOOTH_TAU_S),
                 bright_smoother: PotSmoother::new(SR, init_bright, POT_SMOOTH_TAU_S),
                 tone_smoother: PotSmoother::new(SR, init_tone, POT_SMOOTH_TAU_S),
@@ -1990,11 +2077,10 @@ mod decay_buzz_probe {
                     V2B_GRID_LEAK_OHMS,
                 ),
                 amp_topology,
+                supply,
                 preamp_tap,
                 power_tube_tap,
                 current_channel_mode: ChannelMode::Bright,
-                preamp_current_sum: 0.0,
-                preamp_current_count: 0,
                 meter_this_host_sample: false,
                 v1_plate_sum: 0.0,
                 v2_plate_sum: 0.0,
@@ -2015,7 +2101,7 @@ mod decay_buzz_probe {
                     BLOCK,
                     DEFAULT_SPEAKER_ID,
                     DEFAULT_CABINET_ID,
-                    "sennheiser_md421",
+                    "dynamic_421",
                     RoomSelection::SmallStudio,
                     MicrophonePlacement {
                         distance_m: 5.5 * 0.0254,
@@ -2052,18 +2138,21 @@ mod decay_buzz_probe {
                     }
                     engine.end_buffer();
                 }
-                let mic: Vec<f32> = ot
-                    .iter()
-                    .map(|&v| {
-                        let (l, r) = cab.process(v, 1.0);
-                        0.5 * (l + r)
-                    })
-                    .collect();
-                let m = window_metrics(&mic);
+                let mut mic_l = Vec::with_capacity(ot.len());
+                let mut mic_r = Vec::with_capacity(ot.len());
+                for &v in &ot {
+                    let (l, r) = cab.process(v, 1.0);
+                    mic_l.push(l);
+                    mic_r.push(r);
+                }
+                // The fizz metric wants one signal; the left channel is that
+                // signal. Summing the pair to get it would reintroduce the
+                // downmix and comb the decorrelated room tail.
+                let m = window_metrics(&mic_l);
                 for (i, s) in winstats.iter_mut().enumerate() {
                     s.0 = m.get(i).map_or(0.0, |&(_, f)| f);
                 }
-                (ot, mic, winstats)
+                (ot, mic_l, mic_r, winstats)
             }};
         }
         match os {
@@ -2095,10 +2184,9 @@ mod decay_buzz_probe {
         ];
         let mut results = Vec::new();
         for (name, os, dynamic) in arms {
-            let (_ot, mic, stats) = render_playtest(&di, os, dynamic);
-            let peak = mic.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-9);
-            let norm: Vec<f32> = mic.iter().map(|&v| 0.891 * v / peak).collect();
-            write_wav_f32(&dir.join(format!("ab_{name}.wav")), &norm);
+            let (_ot, mic_l, mic_r, stats) = render_playtest(&di, os, dynamic);
+            let norm = interleave_normalised(&mic_l, &mic_r, 0.891);
+            write_wav_f32(&dir.join(format!("ab_{name}.wav")), &norm, 2);
             eprintln!("  wrote /tmp/tweed_probe/ab_{name}.wav");
             results.push((name, stats));
         }
@@ -2167,6 +2255,7 @@ mod decay_buzz_probe {
         write_wav_f32(
             &dir.join("bisect_ot.wav"),
             &ot.iter().map(|&v| 0.891 * v / peak).collect::<Vec<_>>(),
+            1,
         );
         eprintln!("  OT secondary peak: {peak:.2} V");
 
@@ -2186,14 +2275,19 @@ mod decay_buzz_probe {
                 SpeakerCabRoomConfig {
                     speaker_wiring: SpeakerWiring::single(DEFAULT_SPEAKER_ID),
                     cabinet_id: DEFAULT_CABINET_ID.into(),
-                    microphone_id: "sennheiser_md421".into(),
-                    placement: MicrophonePlacement {
-                        distance_m: 5.5 * 0.0254,
-                        radial_offset_cm: 4.0,
-                        off_axis_angle_deg: 0.0,
+                    mic_primary: MicChannelConfig {
+                        microphone_id: "dynamic_421".into(),
+                        placement: MicrophonePlacement {
+                            distance_m: 5.5 * 0.0254,
+                            radial_offset_cm: 4.0,
+                            off_axis_angle_deg: 0.0,
+                        },
+                        preamp_gain_db: 35.0,
+                        polarity_inverted: false,
+                        pan: 0.0,
                     },
-                    room_id: "small_studio".into(),
-                    mic_preamp_gain_db: 35.0,
+                    mic_secondary: None,
+                    room_id: Some("small_studio".into()),
                     speaker_enabled: speaker,
                     response_enabled: response,
                     cabinet_enabled: cabinet,
@@ -2201,17 +2295,22 @@ mod decay_buzz_probe {
                     room_enabled: room,
                 },
             );
-            let out: Vec<f32> = ot
+            let mut out_l = Vec::with_capacity(ot.len());
+            let mut out_r = Vec::with_capacity(ot.len());
+            for &v in &ot {
+                let (l, r) = chain.process(v, 1.0);
+                out_l.push(l);
+                out_r.push(r);
+            }
+            let peak = out_l
                 .iter()
-                .map(|&v| {
-                    let (l, r) = chain.process(v, 1.0);
-                    0.5 * (l + r)
-                })
-                .collect();
-            let peak = out.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-9);
+                .chain(out_r.iter())
+                .fold(0.0f32, |m, &v| m.max(v.abs()))
+                .max(1e-9);
             write_wav_f32(
                 &dir.join(format!("bisect_{label}.wav")),
-                &out.iter().map(|&v| 0.891 * v / peak).collect::<Vec<_>>(),
+                &interleave_normalised(&out_l, &out_r, 0.891),
+                2,
             );
             eprintln!("  wrote bisect_{label}.wav (peak {peak:.4})");
         }
@@ -2239,7 +2338,7 @@ mod decay_buzz_probe {
             BLOCK,
             DEFAULT_SPEAKER_ID,
             DEFAULT_CABINET_ID,
-            "sennheiser_md421",
+            "dynamic_421",
             RoomSelection::SmallStudio,
             MicrophonePlacement {
                 distance_m: 5.5 * 0.0254,
@@ -2319,7 +2418,7 @@ mod decay_buzz_probe {
                 BLOCK,
                 DEFAULT_SPEAKER_ID,
                 DEFAULT_CABINET_ID,
-                "sennheiser_md421",
+                "dynamic_421",
                 RoomSelection::SmallStudio,
                 MicrophonePlacement {
                     distance_m: 5.5 * 0.0254,
@@ -2344,16 +2443,25 @@ mod decay_buzz_probe {
                 }
                 engine.end_buffer();
             }
+            let mut mic_r = Vec::with_capacity(ot.len());
             for &v in &ot {
                 let (l, r) = cab.process(v, 1.0);
-                mic.push(0.5 * (l + r));
+                mic.push(l);
+                mic_r.push(r);
             }
 
-            for (tag, x) in [("ot", &ot), ("v2a", &v2a), ("v1a", &v1a), ("mic", &mic)] {
+            // ot/v2a/v1a are circuit-node voltages — single-ended by nature,
+            // so they stay mono. Only the mic render is an acoustic output.
+            for (tag, x) in [("ot", &ot), ("v2a", &v2a), ("v1a", &v1a)] {
                 let peak = x.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-9);
                 let norm: Vec<f32> = x.iter().map(|&v| 0.891 * v / peak).collect();
-                write_wav_f32(&dir.join(format!("plugin_{stem}_{tag}.wav")), &norm);
+                write_wav_f32(&dir.join(format!("plugin_{stem}_{tag}.wav")), &norm, 1);
             }
+            write_wav_f32(
+                &dir.join(format!("plugin_{stem}_mic.wav")),
+                &interleave_normalised(&mic, &mic_r, 0.891),
+                2,
+            );
 
             // Gain ladder: absolute AC levels per tap over the loudest 100 ms.
             let conditioned_pk = di

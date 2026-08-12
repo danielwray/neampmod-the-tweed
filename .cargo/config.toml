@@ -1,10 +1,14 @@
-# Build filters — only the listed assets are generated/embedded from the engine.
+# Build filters — only the listed assets are embedded from the engine.
+# Unset means "embed the whole registry", so name what the plugin uses.
+# Microphones and rooms are deliberately left unset: the Dynamic cab chain
+# offers the full set on the front panel.
+#
+# Tubes carry no filter — V1, V2, the 6V6 pair and the 5Y3 all generate at
+# construction from atomic specimens, which the tubegen crate embeds rather
+# than the registry build.rs.
 [env]
-# Every tube now generates at construction from atomic specimens, so the
-# registry is unused — but an empty filter means "build all", so keep one.
-#NEAMPMOD_TUBES = "ge_5y3"
-#NEAMPMOD_SPEAKERS = "jensen_p12r"
-#NEAMPMOD_CABINETS = "fender_5e3_open_back_1x12"
+THERMIONICDSP_SPEAKERS = "p12r"
+THERMIONICDSP_CABINETS = "tweed_5e3_open_back_1x12"
 
 # x86-64 baseline: https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels
 [target.'cfg(target_arch = "x86_64")']
