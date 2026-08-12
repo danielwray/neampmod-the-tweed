@@ -104,9 +104,10 @@ WARNING: I am not able to test the Windows or MacOS artifacts; Please raise an i
 To install the plugins copy the `.vst3` artifact(s0) to your VST3 directory, and likewise to your `.clap` directory for
 the CLAP plugin.
 
-The plugin does not ship with a default IR file - you must load your own. The following sources provide excellent impulse response files:
+The plugin does not ship with a default IR file - you must load your own or use the dynamic cab simulation.
 
-* [Origin Effects IR Cab Library](https://origineffects.com/product/ir-cab-library/)
+The following sources provide excellent impulse response files:
+
 * [Tone3000](https://tone3000.com/)
 
 ### Tone3000 IR Files

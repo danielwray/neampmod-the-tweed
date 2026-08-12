@@ -2,7 +2,7 @@
 name = "the-tweed"
 version = "1.0.0" # default to 1.0.0 as will be replaced in pipeline when building release
 edition = "2024"
-authors = ["NEAMPMOD <daniel.wray.uk+neampmod@gmail.com>"]
+authors = ["Daniel Wray"]
 description = "Physics-based amplifier simulator inspired by the 1957 Fender Tweed Deluxe 5e3 amplifier."
 license = "GPL-3.0-or-later"
 
@@ -11,9 +11,8 @@ name = "the_tweed"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-# NEAMPMOD DSP Engine - provides all tube modeling, filters, IR convolution
-neampmod-engine = { path = "../neampmod-engine" }
-
+# ThermionicDSP engine - provides all tube modeling, filters, IR convolution
+ThermionicDSP = { path = "../thermionic-products/ThermionicDSP" }
 # Audio plugin framework
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = [] }
 # lv2 = { version = "0.6", optional = true }

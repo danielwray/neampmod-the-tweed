@@ -18,13 +18,11 @@ jobs:
         with:
           path: neampmod-the-tweed
 
-      - name: Checkout engine mirror
+      - name: Checkout ThermionicDSP
         uses: actions/checkout@v6
         with:
-          repository: danielwray/neampmod-engine-mirror
-          token: ${{ secrets.ENGINE_TOKEN }}
-          persist-credentials: true
-          path: neampmod-engine
+          repository: danielwray/ThermionicDSP
+          path: thermionic-products/ThermionicDSP
 
       - name: Install Rust 1.92
         uses: dtolnay/rust-toolchain@master
@@ -88,13 +86,11 @@ jobs:
         with:
           path: neampmod-the-tweed
 
-      - name: Checkout engine mirror
+      - name: Checkout ThermionicDSP
         uses: actions/checkout@v6
         with:
-          repository: danielwray/neampmod-engine-mirror
-          token: ${{ secrets.ENGINE_TOKEN }}
-          persist-credentials: true
-          path: neampmod-engine
+          repository: danielwray/ThermionicDSP
+          path: thermionic-products/ThermionicDSP
 
       - name: Install Rust 1.92
         uses: dtolnay/rust-toolchain@master
@@ -148,13 +144,11 @@ jobs:
         with:
           path: neampmod-the-tweed
 
-      - name: Checkout engine mirror
+      - name: Checkout ThermionicDSP
         uses: actions/checkout@v6
         with:
-          repository: danielwray/neampmod-engine-mirror
-          token: ${{ secrets.ENGINE_TOKEN }}
-          persist-credentials: true
-          path: neampmod-engine
+          repository: danielwray/ThermionicDSP
+          path: thermionic-products/ThermionicDSP
 
       - name: Install Rust 1.92
         uses: dtolnay/rust-toolchain@master
